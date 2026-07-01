@@ -13,6 +13,7 @@ from weaver.journal import log_trade
 from weaver.predictions import log_prediction
 from weaver.research import (
     _fmt_money,
+    _parse_news_item,
     _fmt_num,
     _format_age,
     fetch_prior_views,
@@ -273,3 +274,83 @@ class TestFormatHelpers:
         now = datetime.now(tz=timezone.utc)
         dt = now - timedelta(days=2)
         assert _format_age(dt) == "2d ago"
+
+
+# Captured from a live yfinance call on 2026-07-01 — reflects the current
+# nested-content structure where all fields live under item["content"].
+_REAL_NEWS_ITEM = {
+    "id": "af0da905-cc0e-4368-934e-cc9ff4234458",
+    "content": {
+        "id": "af0da905-cc0e-4368-934e-cc9ff4234458",
+        "contentType": "VIDEO",
+        "title": "What's next for AI and Big Tech in the second half of 2026?",
+        "pubDate": "2026-07-01T14:19:12Z",
+        "provider": {
+            "displayName": "Yahoo Finance Video",
+            "url": "https://finance.yahoo.com/",
+            "sourceId": "video.yahoofinance.com",
+        },
+        "canonicalUrl": {
+            "url": "https://finance.yahoo.com/video/whats-next-for-ai-141912104.html",
+        },
+        "clickThroughUrl": {
+            "url": "https://finance.yahoo.com/video/whats-next-for-ai-141912104.html",
+        },
+    },
+}
+
+_LEGACY_NEWS_ITEM = {
+    "title": "NVDA hits record high",
+    "publisher": "Reuters",
+    "link": "https://reuters.com/nvda-record",
+    "providerPublishTime": 1751385600,
+}
+
+
+class TestParseNewsItem:
+    def test_extracts_title_from_content(self) -> None:
+        parsed = _parse_news_item(_REAL_NEWS_ITEM)
+        assert parsed["title"] == "What's next for AI and Big Tech in the second half of 2026?"
+
+    def test_extracts_publisher_from_provider(self) -> None:
+        parsed = _parse_news_item(_REAL_NEWS_ITEM)
+        assert parsed["publisher"] == "Yahoo Finance Video"
+
+    def test_extracts_url_from_canonical_url(self) -> None:
+        parsed = _parse_news_item(_REAL_NEWS_ITEM)
+        assert parsed["url"] == "https://finance.yahoo.com/video/whats-next-for-ai-141912104.html"
+
+    def test_parses_iso_pub_date_to_age(self) -> None:
+        parsed = _parse_news_item(_REAL_NEWS_ITEM)
+        # pubDate is in the past relative to today (2026-07-01), so age is non-None
+        assert parsed["age"] is not None
+        assert "ago" in parsed["age"]
+
+    def test_legacy_flat_structure_still_parses(self) -> None:
+        parsed = _parse_news_item(_LEGACY_NEWS_ITEM)
+        assert parsed["title"] == "NVDA hits record high"
+        assert parsed["publisher"] == "Reuters"
+        assert parsed["url"] == "https://reuters.com/nvda-record"
+
+    def test_legacy_unix_timestamp_produces_age(self) -> None:
+        parsed = _parse_news_item(_LEGACY_NEWS_ITEM)
+        assert parsed["age"] is not None
+        assert "ago" in parsed["age"]
+
+    def test_empty_item_returns_safe_defaults(self) -> None:
+        parsed = _parse_news_item({})
+        assert parsed["title"] == ""
+        assert parsed["publisher"] == ""
+        assert parsed["url"] == ""
+        assert parsed["age"] is None
+
+    def test_prefers_canonical_url_over_click_through(self) -> None:
+        item = {
+            "content": {
+                "title": "Test",
+                "canonicalUrl": {"url": "https://canonical.example.com"},
+                "clickThroughUrl": {"url": "https://clickthrough.example.com"},
+            }
+        }
+        parsed = _parse_news_item(item)
+        assert parsed["url"] == "https://canonical.example.com"

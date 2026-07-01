@@ -141,28 +141,57 @@ def fetch_news(ticker: str, limit: int = 8) -> list[dict[str, Any]]:
         try:
             t = yf.Ticker(ticker)
             raw = t.news or []
-            articles = []
-            for item in raw[:limit]:
-                pub_time = item.get("providerPublishTime")
-                age: Optional[str] = None
-                if pub_time:
-                    try:
-                        pub_dt = datetime.fromtimestamp(pub_time, tz=timezone.utc)
-                        age = _format_age(pub_dt)
-                    except Exception:
-                        pass
-                articles.append({
-                    "title": item.get("title", ""),
-                    "publisher": item.get("publisher", ""),
-                    "age": age,
-                    "url": item.get("link", ""),
-                })
-            return articles
+            return [_parse_news_item(item) for item in raw[:limit] if item]
         except Exception:
             if attempt < 2:
                 time.sleep(2 ** attempt)
 
     return []
+
+
+def _parse_news_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Normalise a single yfinance news item into {title, publisher, age, url}.
+
+    Current yfinance nests all article fields under a 'content' key.
+    Falls back to top-level fields so old-format items still parse correctly.
+    """
+    # Current API: everything lives under item["content"]
+    content: dict[str, Any] = item.get("content") or item
+
+    title = content.get("title", "")
+
+    # Publisher: content["provider"]["displayName"]
+    provider = content.get("provider") or {}
+    publisher = provider.get("displayName", "") or item.get("publisher", "")
+
+    # URL: prefer canonicalUrl, fall back to clickThroughUrl, then legacy "link"
+    canonical = content.get("canonicalUrl") or {}
+    click_through = content.get("clickThroughUrl") or {}
+    url = (
+        canonical.get("url")
+        or click_through.get("url")
+        or item.get("link", "")
+    )
+
+    # Timestamp: current API uses ISO 8601 pubDate; legacy used Unix providerPublishTime
+    age: Optional[str] = None
+    pub_date_str = content.get("pubDate")
+    pub_time_unix = item.get("providerPublishTime")
+
+    if pub_date_str:
+        try:
+            pub_dt = datetime.fromisoformat(pub_date_str.replace("Z", "+00:00"))
+            age = _format_age(pub_dt)
+        except Exception:
+            pass
+    elif pub_time_unix:
+        try:
+            pub_dt = datetime.fromtimestamp(int(pub_time_unix), tz=timezone.utc)
+            age = _format_age(pub_dt)
+        except Exception:
+            pass
+
+    return {"title": title, "publisher": publisher, "age": age, "url": url}
 
 
 def fetch_prior_views(vault_path: Path, ticker: str) -> dict[str, Any]:
