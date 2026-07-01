@@ -1,0 +1,40 @@
+# Obsidian vault path — the folder containing your Trading/ subfolder.
+# Override at runtime with the OBSIDIAN_VAULT_PATH environment variable.
+# Leave blank here and set the env var instead (vault path differs per machine).
+vault_path: ""
+
+watchlist:
+  chips:
+    - NVDA
+    - AMD
+    - TSM
+    - ASML
+    - AVGO
+  chip_designers:
+    - ARM
+    - MRVL
+  cloud:
+    - MSFT
+    - GOOGL
+    - AMZN
+    - META
+  power_infra:
+    - VRT
+    - CEG
+    - ETN
+  software:
+    - CRM
+    - PLTR
+  baselines:
+    - SPY
+    - QQQ
+    - SOXX
+
+data:
+  yfinance:
+    retry_attempts: 3
+    retry_delay_seconds: 2
+  fred:
+    retry_attempts: 3
+  edgar:
+    retry_attempts: 3
