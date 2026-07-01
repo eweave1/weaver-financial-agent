@@ -1,69 +1,79 @@
 # weaver-financial-agent
 
-Personal financial research agent for active AI-sector stock trading. Researches,
-monitors, journals, and makes logged predictions — but **never executes trades**.
-Every trade decision is made and placed manually.
+A personal AI-powered research agent for equity analysis, focused on the AI/semiconductor sector.
 
-## Philosophy: notify and review
+It researches, monitors markets, journals trades, and tracks its own predictions against reality — but it **never executes trades**. Every decision stays with the human.
 
-This agent surfaces information; I make every call. It never says "buy X" or
-"target $Y." Every output requires active review before any real-world action.
+## Philosophy
 
-This constraint is intentional and permanent. The value is in building a
-disciplined, auditable research process — not in automating decisions.
+Most "AI trading bot" projects optimize for autonomy: give the machine money and let it trade. This one is built on the opposite principle.
+
+The evidence on autonomous retail trading is not encouraging, and handing capital to a self-directed agent — especially one that can be misled by injected content or a bad data feed — is a fast way to lose money. So this agent is deliberately constrained to the role where AI actually adds value: **synthesis and research, not decision-making.**
+
+The design principle is **notify and review**. The agent surfaces information, builds steelmanned bull and bear cases, and logs predictions. The human reads, thinks, and decides. Nothing reaches a broker automatically. Ever.
+
+The secondary goal is learning. Every prediction the agent makes — and every trade the human makes — gets logged with its reasoning and later scored against what actually happened. Over time this builds an honest track record of *both* the agent's analysis and the human's judgment, so the real question can be answered: does this system actually make better decisions, or just more confident ones?
+
+## What it does
+
+The agent is built from four components, in build order:
+
+| Component | Status | Description |
+|-----------|--------|-------------|
+| 4 — Trade Journal + Prediction Log | **Built** | Log trades and predictions; resolve predictions with three outcome categories |
+| 1 — Morning Briefing | Planned | Pre-market macro + watchlist digest, 7 AM ET on trading days |
+| 3 — Pre-Trade Research | Planned | Per-ticker deep dive with steelmanned bull/bear cases |
+| 2 — Catalyst Scanner | Planned | Market-hours monitor: filings, volume spikes, moves >3%, insider transactions |
+
+**Trade Journal & Prediction Log** — Records every trade with its reasoning, target, and stop. Separately logs predictions with a resolve-by date, then scores them against actual outcomes using three categories: *right* (the reasoning held), *wrong* (the reasoning was tested and failed), and *unforeseen* (the market moved for a reason outside the original analysis — a tail event, scored separately so it doesn't discredit sound reasoning).
+
+**Morning Briefing** — A pre-market summary delivered daily, structured in three tiers: macro/market conditions, AI-sector news, and detailed coverage of a configurable watchlist.
+
+**Pre-Trade Research** — On-demand deep-dive notes on a given ticker: business health, valuation context, current setup, steelmanned bull and bear cases, key risks, and a recap of the user's own prior views on that stock.
+
+**Catalyst Scanner** — Market-hours monitoring for meaningful events (filings, unusual volume, large moves, rating changes, insider transactions) across both the watchlist and a broader universe, filtered by a priority score to cut noise.
 
 ## Architecture
 
-This repo (`weaver-financial-agent`) is a **standalone Python package**. It
-handles data fetching, analysis, report generation, and markdown formatting.
-It writes files directly to an Obsidian vault. It has no LLM dependency and no
-dependency on any delivery layer — it runs and tests cleanly on its own.
+The project is split into two layers by design:
 
-A separate layer (Hermes skills, built later) schedules the package's functions,
-applies LLM reasoning via DeepSeek, and delivers outputs to Telegram. That
-separation means the financial logic here survives even if the delivery layer
-changes.
+- **This repository** is a standalone Python package containing all domain logic — data fetching, analysis, report generation, markdown formatting. It calls no language models and depends on no agent framework. It writes files directly to an Obsidian vault and can be run and tested entirely on its own.
+- **The agent layer** (built separately) wraps this package with an LLM for reasoning and a messaging interface for delivery. Because the financial logic lives here independently, the agent layer can be swapped or replaced without touching the core.
 
-```
-weaver-financial-agent/   ← this repo
-├── weaver/               ← Python package: data, analysis, markdown
-└── tests/
+This separation keeps the analytical code testable, portable, and honest about what it is: a research tool, not a black box.
 
-hermes-skills/ (separate, later)
-└── financial/            ← scheduling, LLM calls, Telegram delivery
-```
+### Obsidian vault structure
 
-## Obsidian vault structure
-
-All trading files live in a top-level `Trading/` folder in the vault:
+All trading files live in a top-level `Trading/` folder in the vault, formatted with YAML frontmatter so Obsidian's Dataview plugin can query across entries:
 
 ```
 Trading/
 ├── Journal/       ← trade entries (buy/sell)
 ├── Predictions/   ← prediction log with resolution tracking
-├── Research/      ← pre-trade research notes (Component 3)
-├── Briefings/     ← daily morning briefings (Component 1)
-└── Reviews/       ← weekly/monthly reviews (later)
+├── Research/      ← pre-trade research notes
+├── Briefings/     ← daily morning briefings
+└── Reviews/       ← weekly/monthly reviews
 ```
 
-Files use YAML frontmatter throughout so Obsidian's Dataview plugin can query
-across entries — filter open trades, score prediction accuracy, etc.
+## Data sources
 
-## Components
+Built on free, public data to start:
 
-| Component | Status | Description |
-|-----------|--------|-------------|
-| 4 — Trade Journal + Prediction Log | **Built** | Log trades, log predictions, resolve predictions with three outcome categories |
-| 1 — Morning Briefing | Planned | Daily macro + watchlist digest, 7 AM ET on trading days |
-| 3 — Pre-Trade Research | Planned | Per-ticker deep dive with steelmanned bull/bear cases |
-| 2 — Catalyst Scanner | Planned | Market-hours monitor: filings, volume spikes, moves >3% |
+- **yfinance** — price, volume, fundamentals, news
+- **SEC EDGAR** — filings and insider transactions
+- **FRED** — macroeconomic indicators
+
+No paid data feeds unless a specific, demonstrated gap justifies one.
+
+## Model routing
+
+The reasoning layer routes tasks by cost and difficulty: a fast, inexpensive model handles high-volume mechanical work (summaries, filtering), while a stronger model is reserved for the tasks where reasoning quality actually affects a decision (research notes, briefing synthesis).
 
 ## Setup
 
 **Requirements:** Python 3.11+
 
 ```bash
-# Clone
 git clone https://github.com/eweave1/weaver-financial-agent.git
 cd weaver-financial-agent
 
@@ -82,12 +92,11 @@ cp .env.example .env
 
 ## Usage
 
-All commands are run via the `wf` CLI.
+All commands run via the `wf` CLI.
 
 ### Log a trade
 
 ```bash
-# Buy
 wf log-trade \
   --ticker NVDA \
   --action buy \
@@ -98,7 +107,7 @@ wf log-trade \
   --horizon swing \
   --target 170.00
 
-# Sell (link back to the buy entry)
+# Sell entry, linked back to the buy
 wf log-trade \
   --ticker NVDA \
   --action sell \
@@ -109,9 +118,6 @@ wf log-trade \
   --horizon swing \
   --linked-buy "2026-06-30 NVDA buy"
 ```
-
-This writes `Trading/Journal/2026-06-30 NVDA buy.md` with YAML frontmatter
-carrying all structured fields for Dataview queries.
 
 ### Log a prediction
 
@@ -125,54 +131,31 @@ wf log-prediction \
   --resolve-by 2026-07-14
 ```
 
-Writes `Trading/Predictions/2026-06-30 NVDA.md`.
-
 ### Resolve overdue predictions
 
 ```bash
 wf resolve-predictions
 ```
 
-Lists all open predictions past their resolve-by date. For each one, fetches
-the actual price movement from yfinance and prompts for the outcome:
-
-- **Right** — reasoning held and the call was correct
-- **Wrong** — reasoning was tested and failed
-- **Unforeseen** — market moved for a reason outside the original thesis (tail
-  event, macro shock, etc.); scored separately so it doesn't wrongly penalize
-  sound analysis
-
-The distinction between *wrong* and *unforeseen* is yours to make — the agent
-shows you the actual price data and asks.
-
-### Override config or vault path
-
-```bash
-# Use a different config file
-wf --config /path/to/config.yaml log-trade ...
-
-# Override vault path without editing .env
-OBSIDIAN_VAULT_PATH=/tmp/test-vault wf log-trade ...
-```
+Lists all open predictions past their resolve-by date. For each one, fetches the actual price movement from yfinance and prompts you to categorize the outcome as `right`, `wrong`, or `unforeseen`. The distinction between wrong and unforeseen is always yours to make — the agent shows you the data, not the verdict.
 
 ## Running tests
 
 ```bash
 pytest
-pytest --cov=weaver --cov-report=term-missing   # with coverage
+pytest --cov=weaver --cov-report=term-missing
 ```
 
-Tests use `tmp_path` (pytest's built-in temp directory fixture) — no vault
-setup needed, no network calls.
+Tests use `tmp_path` (pytest's built-in temp directory) — no vault setup, no network calls required.
 
-## Watchlist and config
+## Status
 
-Edit `config.yaml` to adjust the watchlist or data settings. No code changes
-needed. The vault path lives in `.env` (or `OBSIDIAN_VAULT_PATH` env var) so
-it can differ between machines without touching config.
+Early and in active development. Built component by component, tested against a month of paper trading before any real capital is ever considered.
 
-## Paper trading policy
+## Disclaimer
 
-No real capital until at least one month of consistent paper-trading
-profitability across varied market conditions. The prediction resolution system
-exists partly to hold that bar honestly.
+This is a personal learning project. It is not investment advice, and it produces none. Nothing in this repository recommends buying or selling any security. The author is not a financial advisor. Markets carry real risk of loss; do your own research and make your own decisions.
+
+## License
+
+MIT
