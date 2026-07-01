@@ -4,6 +4,7 @@ Usage:
     wf log-trade      --ticker NVDA --action buy ...
     wf log-prediction --ticker NVDA --direction up ...
     wf resolve-predictions
+    wf research       --ticker NVDA
 """
 
 from __future__ import annotations
@@ -327,3 +328,35 @@ def _fetch_actual_direction(
         return f"{label} ({pct:+.1%}, ${entry_price:.2f} → ${exit_price:.2f})"
     except Exception:
         return None
+
+
+# ── research ──────────────────────────────────────────────────────────────────
+
+@main.command("research")
+@click.option("--ticker", required=True, help="Stock ticker to research (e.g. NVDA).")
+@click.option(
+    "--date",
+    "research_date",
+    type=click.DateTime(formats=["%Y-%m-%d"]),
+    default=None,
+    help="Research date as YYYY-MM-DD (defaults to today).",
+)
+@click.pass_context
+def research_cmd(
+    ctx: click.Context,
+    ticker: str,
+    research_date: Optional[datetime],
+) -> None:
+    """Fetch market data for a ticker and write a research note to Trading/Research/."""
+    from weaver.research import generate_research_note
+
+    vault_path = _vault(ctx)
+    rd = research_date.date() if research_date else None
+
+    click.echo(f"Fetching data for {ticker.upper()}...")
+    filepath = generate_research_note(
+        vault_path=vault_path,
+        ticker=ticker,
+        research_date=rd,
+    )
+    click.echo(f"Research note written: {filepath}")
