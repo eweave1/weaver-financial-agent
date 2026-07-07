@@ -1,14 +1,20 @@
 """CLI entry points for weaver-financial-agent.
 
-Usage:
-    wf log-trade      --ticker NVDA --action buy ...
-    wf log-prediction --ticker NVDA --direction up ...
-    wf resolve-predictions
-    wf research       --ticker NVDA
+All fields on log-trade and log-prediction are optional flags. If any are
+omitted the command prompts for them interactively in logical order:
+
+  wf log-trade                        # fully interactive wizard
+  wf log-trade --ticker NVDA          # ticker provided, rest prompted
+  wf log-trade --ticker NVDA --action buy --quantity 10 ...  # fully scripted
+
+Free-text fields (--reason, --stop, --reasoning) are always prompted as plain
+text input — no shell quoting needed, dollar signs and arrows type freely.
+Structured fields (action, horizon, direction) prompt with choices shown.
 """
 
 from __future__ import annotations
 
+import sys
 from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
@@ -26,7 +32,7 @@ from weaver.predictions import (
 )
 
 
-# ── group ────────────────────────────────────────────────────────────────────
+# ── group ─────────────────────────────────────────────────────────────────────
 
 @click.group()
 @click.option(
@@ -44,124 +50,155 @@ def main(ctx: click.Context, config_path: Optional[Path]) -> None:
 
 
 def _vault(ctx: click.Context) -> Path:
-    config = load_config(ctx.obj["config_path"])
-    return get_vault_path(config)
+    try:
+        config = load_config(ctx.obj["config_path"])
+        return get_vault_path(config)
+    except ValueError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
 
 
-# ── log-trade ────────────────────────────────────────────────────────────────
+# ── log-trade ─────────────────────────────────────────────────────────────────
 
 @main.command("log-trade")
-@click.option("--ticker", required=True, help="Stock ticker (e.g. NVDA).")
+@click.option("--ticker", default=None, help="Stock ticker (e.g. NVDA).")
 @click.option(
     "--action",
-    required=True,
+    default=None,
     type=click.Choice(list(VALID_ACTIONS)),
     help="buy or sell.",
 )
-@click.option("--quantity", required=True, type=float, help="Number of shares.")
-@click.option("--price", required=True, type=float, help="Execution price per share.")
-@click.option("--reason", required=True, help="One-sentence reason for this trade.")
+@click.option("--quantity", default=None, type=float, help="Number of shares.")
+@click.option("--price", default=None, type=float, help="Execution price per share.")
+@click.option("--reason", default=None, help="One-sentence reason for this trade.")
 @click.option(
     "--stop",
     "stop_condition",
-    required=True,
-    help="Stop/exit condition (e.g. 'Close below 145').",
+    default=None,
+    help="Stop/exit condition (e.g. 'Close below $145').",
 )
 @click.option(
     "--horizon",
     "time_horizon",
-    required=True,
+    default=None,
     type=click.Choice(list(VALID_HORIZONS)),
     help="Time horizon: day, swing, or hold.",
 )
+@click.option("--target", "target_exit", type=float, default=None,
+              help="Target exit price (optional).")
 @click.option(
-    "--target",
-    "target_exit",
-    type=float,
-    default=None,
-    help="Target exit price (optional).",
-)
-@click.option(
-    "--date",
-    "trade_date",
+    "--date", "trade_date",
     type=click.DateTime(formats=["%Y-%m-%d"]),
     default=None,
     help="Trade date as YYYY-MM-DD (defaults to today).",
 )
-@click.option(
-    "--linked-buy",
-    default=None,
-    help="For sell entries: filename stem of the linked buy entry "
-         "(e.g. '2026-06-30 NVDA buy').",
-)
+@click.option("--linked-buy", default=None,
+              help="For sell entries: stem of the linked buy file "
+                   "(e.g. '2026-06-30 NVDA buy').")
 @click.pass_context
 def log_trade_cmd(
     ctx: click.Context,
-    ticker: str,
-    action: str,
-    quantity: float,
-    price: float,
-    reason: str,
-    stop_condition: str,
-    time_horizon: str,
+    ticker: Optional[str],
+    action: Optional[str],
+    quantity: Optional[float],
+    price: Optional[float],
+    reason: Optional[str],
+    stop_condition: Optional[str],
+    time_horizon: Optional[str],
     target_exit: Optional[float],
     trade_date: Optional[datetime],
     linked_buy: Optional[str],
 ) -> None:
-    """Log a buy or sell trade to the journal."""
+    """Log a buy or sell trade to the journal.
+
+    All fields can be passed as flags or entered interactively when omitted.
+    Free-text fields (--reason, --stop) are always safe to type at a prompt —
+    no shell quoting or escaping needed.
+    """
+    # ── structured fields: prompt with type validation if omitted ─────────────
+    if ticker is None:
+        ticker = click.prompt("Ticker")
+    ticker = ticker.upper()
+
+    if action is None:
+        action = click.prompt("Action", type=click.Choice(list(VALID_ACTIONS)))
+
+    if quantity is None:
+        quantity = click.prompt("Quantity", type=float)
+
+    if price is None:
+        price = click.prompt("Price", type=float)
+
+    if time_horizon is None:
+        time_horizon = click.prompt(
+            "Time horizon", type=click.Choice(list(VALID_HORIZONS))
+        )
+
+    # target is optional — only prompt in wizard mode (when reason+stop are also missing)
+    if target_exit is None and reason is None and stop_condition is None:
+        raw = click.prompt("Target exit price (Enter to skip)", default="",
+                           show_default=False)
+        if raw.strip():
+            try:
+                target_exit = float(raw.strip())
+            except ValueError:
+                click.echo("  Not a valid number — leaving target blank.", err=True)
+
+    # ── free-text fields: plain prompt, type anything freely ──────────────────
+    if reason is None:
+        reason = click.prompt("Reason")
+
+    if stop_condition is None:
+        stop_condition = click.prompt("Stop condition")
+
+    # ── write ─────────────────────────────────────────────────────────────────
     vault_path = _vault(ctx)
     td = trade_date.date() if trade_date else None
-    filepath = log_trade(
-        vault_path=vault_path,
-        ticker=ticker,
-        action=action,
-        quantity=quantity,
-        price=price,
-        reason=reason,
-        stop_condition=stop_condition,
-        time_horizon=time_horizon,
-        target_exit=target_exit,
-        trade_date=td,
-        linked_buy_file=linked_buy,
-    )
+
+    try:
+        filepath = log_trade(
+            vault_path=vault_path,
+            ticker=ticker,
+            action=action,
+            quantity=quantity,
+            price=price,
+            reason=reason,
+            stop_condition=stop_condition,
+            time_horizon=time_horizon,
+            target_exit=target_exit,
+            trade_date=td,
+            linked_buy_file=linked_buy,
+        )
+    except ValueError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+    except Exception as exc:
+        click.echo(f"Unexpected error: {exc}", err=True)
+        sys.exit(1)
+
     click.echo(f"Trade logged: {filepath}")
 
 
-# ── log-prediction ───────────────────────────────────────────────────────────
+# ── log-prediction ────────────────────────────────────────────────────────────
 
 @main.command("log-prediction")
-@click.option("--ticker", required=True, help="Stock ticker (e.g. NVDA).")
+@click.option("--ticker", default=None, help="Stock ticker (e.g. NVDA).")
 @click.option(
     "--direction",
-    required=True,
+    default=None,
     type=click.Choice(list(VALID_DIRECTIONS)),
     help="Predicted direction: up, down, or flat.",
 )
+@click.option("--timeframe", default=None,
+              help="Prediction timeframe (e.g. '2 weeks', '1 month').")
+@click.option("--confidence", default=None, type=float,
+              help="Confidence level from 0.0 to 1.0.")
+@click.option("--reasoning", default=None,
+              help="Your reasoning for this prediction.")
+@click.option("--resolve-by", "resolve_by_str", default=None,
+              help="Date to resolve the prediction by (YYYY-MM-DD).")
 @click.option(
-    "--timeframe",
-    required=True,
-    help="Prediction timeframe (e.g. '2 weeks', '1 month').",
-)
-@click.option(
-    "--confidence",
-    required=True,
-    type=float,
-    help="Confidence level from 0.0 to 1.0.",
-)
-@click.option(
-    "--reasoning",
-    required=True,
-    help="Your reasoning for this prediction.",
-)
-@click.option(
-    "--resolve-by",
-    required=True,
-    type=click.DateTime(formats=["%Y-%m-%d"]),
-    help="Date to resolve the prediction by (YYYY-MM-DD).",
-)
-@click.option(
-    "--date",
-    "prediction_date",
+    "--date", "prediction_date",
     type=click.DateTime(formats=["%Y-%m-%d"]),
     default=None,
     help="Prediction date as YYYY-MM-DD (defaults to today).",
@@ -169,36 +206,86 @@ def log_trade_cmd(
 @click.pass_context
 def log_prediction_cmd(
     ctx: click.Context,
-    ticker: str,
-    direction: str,
-    timeframe: str,
-    confidence: float,
-    reasoning: str,
-    resolve_by: datetime,
+    ticker: Optional[str],
+    direction: Optional[str],
+    timeframe: Optional[str],
+    confidence: Optional[float],
+    reasoning: Optional[str],
+    resolve_by_str: Optional[str],
     prediction_date: Optional[datetime],
 ) -> None:
-    """Log a directional prediction with a resolve-by date."""
+    """Log a directional prediction with a resolve-by date.
+
+    All fields can be passed as flags or entered interactively when omitted.
+    --reasoning is always safe to type freely at a prompt — dollar signs,
+    arrows, and apostrophes all work without shell quoting.
+    """
+    # ── structured fields ─────────────────────────────────────────────────────
+    if ticker is None:
+        ticker = click.prompt("Ticker")
+    ticker = ticker.upper()
+
+    if direction is None:
+        direction = click.prompt(
+            "Direction", type=click.Choice(list(VALID_DIRECTIONS))
+        )
+
+    if timeframe is None:
+        timeframe = click.prompt("Timeframe (e.g. '2 weeks')")
+
+    # confidence: validate range whether from flag or prompt
+    if confidence is None:
+        confidence = click.prompt(
+            "Confidence (0.0–1.0)", type=click.FloatRange(0.0, 1.0)
+        )
+    else:
+        if not 0.0 <= confidence <= 1.0:
+            click.echo(
+                f"Error: --confidence must be between 0.0 and 1.0, got {confidence}",
+                err=True,
+            )
+            sys.exit(1)
+
+    # resolve-by: validate future date whether from flag or prompt
+    if resolve_by_str is None:
+        resolve_by_date = _prompt_future_date("Resolve by (YYYY-MM-DD)")
+    else:
+        resolve_by_date = _parse_future_date_flag(resolve_by_str)
+
+    # ── free-text field ───────────────────────────────────────────────────────
+    if reasoning is None:
+        reasoning = click.prompt("Reasoning")
+
+    # ── write ─────────────────────────────────────────────────────────────────
     vault_path = _vault(ctx)
     pd = prediction_date.date() if prediction_date else None
-    filepath = log_prediction(
-        vault_path=vault_path,
-        ticker=ticker,
-        direction=direction,
-        timeframe=timeframe,
-        confidence=confidence,
-        reasoning=reasoning,
-        resolve_by=resolve_by.date(),
-        prediction_date=pd,
-    )
+
+    try:
+        filepath = log_prediction(
+            vault_path=vault_path,
+            ticker=ticker,
+            direction=direction,
+            timeframe=timeframe,
+            confidence=confidence,
+            reasoning=reasoning,
+            resolve_by=resolve_by_date,
+            prediction_date=pd,
+        )
+    except ValueError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+    except Exception as exc:
+        click.echo(f"Unexpected error: {exc}", err=True)
+        sys.exit(1)
+
     click.echo(f"Prediction logged: {filepath}")
 
 
-# ── resolve-predictions ──────────────────────────────────────────────────────
+# ── resolve-predictions ───────────────────────────────────────────────────────
 
 @main.command("resolve-predictions")
 @click.option(
-    "--date",
-    "as_of_date",
+    "--date", "as_of_date",
     type=click.DateTime(formats=["%Y-%m-%d"]),
     default=None,
     help="Treat predictions overdue as of this date (defaults to today).",
@@ -244,7 +331,6 @@ def resolve_predictions_cmd(
         click.echo(f"  Reasoning:   {pred['reasoning']}")
         click.echo("")
 
-        # Best-effort: fetch actual price movement from yfinance
         actual = _fetch_actual_direction(
             ticker=pred["ticker"],
             prediction_date=pred.get("prediction_date"),
@@ -267,67 +353,21 @@ def resolve_predictions_cmd(
         )
         notes = click.prompt("  Resolution notes")
 
-        resolve_prediction(
-            prediction_file=pred["file"],
-            outcome=outcome,
-            actual_direction=actual_direction,
-            resolution_notes=notes,
-            resolution_date=check_date,
-        )
+        try:
+            resolve_prediction(
+                prediction_file=pred["file"],
+                outcome=outcome,
+                actual_direction=actual_direction,
+                resolution_notes=notes,
+                resolution_date=check_date,
+            )
+        except Exception as exc:
+            click.echo(f"  Error resolving {pred['file'].name}: {exc}", err=True)
+            continue
+
         click.echo(f"  Resolved: {pred['file'].name}\n")
 
     click.echo("All predictions resolved.")
-
-
-# ── helpers ──────────────────────────────────────────────────────────────────
-
-def _fetch_actual_direction(
-    ticker: str,
-    prediction_date: Optional[date],
-    resolve_by: date,
-) -> Optional[str]:
-    """Fetch actual price movement from yfinance.
-
-    Returns a human-readable string like 'up (+4.2%, $150.00 → $156.30)'
-    or None if the fetch fails for any reason.
-    """
-    try:
-        import yfinance as yf
-        from datetime import timedelta
-
-        start = prediction_date or (resolve_by - timedelta(days=90))
-        end = resolve_by + timedelta(days=1)  # yfinance end is exclusive
-
-        hist = yf.download(
-            ticker,
-            start=str(start),
-            end=str(end),
-            progress=False,
-            auto_adjust=True,
-        )
-        if hist is None or hist.empty or len(hist) < 2:
-            return None
-
-        close = hist["Close"]
-        # yfinance >=0.2 may return a DataFrame with MultiIndex columns for
-        # single-ticker downloads in some configurations; flatten if needed.
-        if hasattr(close, "columns"):
-            close = close.iloc[:, 0]
-
-        entry_price = float(close.iloc[0])
-        exit_price = float(close.iloc[-1])
-        pct = (exit_price - entry_price) / entry_price
-
-        if pct > 0.005:
-            label = "up"
-        elif pct < -0.005:
-            label = "down"
-        else:
-            label = "flat"
-
-        return f"{label} ({pct:+.1%}, ${entry_price:.2f} → ${exit_price:.2f})"
-    except Exception:
-        return None
 
 
 # ── research ──────────────────────────────────────────────────────────────────
@@ -335,8 +375,7 @@ def _fetch_actual_direction(
 @main.command("research")
 @click.option("--ticker", required=True, help="Stock ticker to research (e.g. NVDA).")
 @click.option(
-    "--date",
-    "research_date",
+    "--date", "research_date",
     type=click.DateTime(formats=["%Y-%m-%d"]),
     default=None,
     help="Research date as YYYY-MM-DD (defaults to today).",
@@ -354,9 +393,107 @@ def research_cmd(
     rd = research_date.date() if research_date else None
 
     click.echo(f"Fetching data for {ticker.upper()}...")
-    filepath = generate_research_note(
-        vault_path=vault_path,
-        ticker=ticker,
-        research_date=rd,
-    )
+    try:
+        filepath = generate_research_note(
+            vault_path=vault_path,
+            ticker=ticker,
+            research_date=rd,
+        )
+    except Exception as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+
     click.echo(f"Research note written: {filepath}")
+
+
+# ── private helpers ───────────────────────────────────────────────────────────
+
+def _prompt_future_date(prompt_text: str) -> date:
+    """Prompt interactively for a YYYY-MM-DD date that must be in the future.
+
+    Re-prompts with a clear message on bad format or a past date.
+    """
+    while True:
+        raw = click.prompt(prompt_text)
+        try:
+            d = datetime.strptime(raw.strip(), "%Y-%m-%d").date()
+        except ValueError:
+            click.echo(
+                "  Enter a date in YYYY-MM-DD format (e.g. 2026-07-21).",
+                err=True,
+            )
+            continue
+        if d <= date.today():
+            click.echo(
+                f"  Date must be in the future (got {d}, today is {date.today()}).",
+                err=True,
+            )
+            continue
+        return d
+
+
+def _parse_future_date_flag(value: str) -> date:
+    """Parse and validate a --resolve-by flag value. Exits 1 on error."""
+    try:
+        d = datetime.strptime(value.strip(), "%Y-%m-%d").date()
+    except ValueError:
+        click.echo(
+            f"Error: --resolve-by must be in YYYY-MM-DD format, got {value!r}",
+            err=True,
+        )
+        sys.exit(1)
+    if d <= date.today():
+        click.echo(
+            f"Error: --resolve-by must be a future date "
+            f"(got {d}, today is {date.today()})",
+            err=True,
+        )
+        sys.exit(1)
+    return d
+
+
+def _fetch_actual_direction(
+    ticker: str,
+    prediction_date: Optional[date],
+    resolve_by: date,
+) -> Optional[str]:
+    """Fetch actual price movement from yfinance.
+
+    Returns a human-readable string like 'up (+4.2%, $150.00 → $156.30)'
+    or None if the fetch fails for any reason.
+    """
+    try:
+        import yfinance as yf
+        from datetime import timedelta
+
+        start = prediction_date or (resolve_by - timedelta(days=90))
+        end = resolve_by + timedelta(days=1)
+
+        hist = yf.download(
+            ticker,
+            start=str(start),
+            end=str(end),
+            progress=False,
+            auto_adjust=True,
+        )
+        if hist is None or hist.empty or len(hist) < 2:
+            return None
+
+        close = hist["Close"]
+        if hasattr(close, "columns"):
+            close = close.iloc[:, 0]
+
+        entry_price = float(close.iloc[0])
+        exit_price = float(close.iloc[-1])
+        pct = (exit_price - entry_price) / entry_price
+
+        if pct > 0.005:
+            label = "up"
+        elif pct < -0.005:
+            label = "down"
+        else:
+            label = "flat"
+
+        return f"{label} ({pct:+.1%}, ${entry_price:.2f} → ${exit_price:.2f})"
+    except Exception:
+        return None
