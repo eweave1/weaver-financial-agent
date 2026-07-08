@@ -64,3 +64,13 @@ def get_watchlist(config: dict[str, Any]) -> list[str]:
     for group in watchlist.values():
         tickers.extend(group or [])
     return tickers
+
+
+def get_analyze_model(config: dict[str, Any]) -> str:
+    """Return the AI model slug for wf research --analyze."""
+    return config.get("ai", {}).get("analyze_model", "deepseek/deepseek-v4-pro")
+
+
+def get_openrouter_timeout(config: dict[str, Any]) -> int:
+    """Return the OpenRouter request timeout in seconds."""
+    return int(config.get("ai", {}).get("openrouter_timeout_seconds", 90))

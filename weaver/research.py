@@ -1,18 +1,31 @@
 """Pre-trade research — fetch market data and write structured research notes.
 
 Writes to Trading/Research/TICKER - YYYY-MM-DD.md in the Obsidian vault.
-The analysis sections (Setup, Bull case, Bear case, Key risks) are left blank
-for manual fill-in until the LLM layer is built.
+Without --analyze: analysis sections are blank for manual fill-in.
+With --analyze: calls DeepSeek via OpenRouter to fill in analysis sections
+and adds an AI suggested call block before the My call section.
 """
 
 from __future__ import annotations
 
+import json
+import re
 import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+import requests
+
 from weaver.predictions import _parse_frontmatter
+
+_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+_SYSTEM_PROMPT = (
+    "You are a financial research assistant analyzing stocks for a human trader "
+    "who makes all final decisions. Surface balanced analysis — do not give "
+    "investment advice."
+)
 
 
 def generate_research_note(
@@ -21,11 +34,17 @@ def generate_research_note(
     research_date: Optional[date] = None,
     _snapshot: Optional[dict[str, Any]] = None,
     _news: Optional[list[dict[str, Any]]] = None,
+    analyze: bool = False,
+    analyze_model: str = "deepseek/deepseek-v4-pro",
+    openrouter_api_key: Optional[str] = None,
+    openrouter_timeout: int = 90,
+    _ai_analysis: Optional[dict[str, Any]] = None,
 ) -> Path:
     """Fetch data for ticker and write a research note to Trading/Research/.
 
-    _snapshot and _news are injection points for tests — pass them to skip
-    network calls. In normal use leave them as None.
+    _snapshot, _news, and _ai_analysis are injection points for tests.
+    When analyze=True, calls DeepSeek via OpenRouter unless _ai_analysis is
+    provided directly.
 
     Returns the path of the written file.
     """
@@ -39,7 +58,22 @@ def generate_research_note(
     news = _news if _news is not None else fetch_news(ticker)
     prior = fetch_prior_views(vault_path, ticker)
 
-    content = _build_research_note(ticker, note_date, snapshot, news, prior)
+    ai_analysis: Optional[dict[str, Any]] = None
+    if analyze:
+        if _ai_analysis is not None:
+            ai_analysis = _ai_analysis
+        else:
+            ai_analysis = analyze_with_ai(
+                ticker=ticker,
+                snapshot=snapshot,
+                news=news,
+                prior=prior,
+                model=analyze_model,
+                api_key=openrouter_api_key or "",
+                timeout=openrouter_timeout,
+            )
+
+    content = _build_research_note(ticker, note_date, snapshot, news, prior, ai_analysis)
 
     filepath = research_dir / f"{ticker} - {note_date}.md"
     filepath.write_text(content, encoding="utf-8")
@@ -241,6 +275,264 @@ def fetch_prior_views(vault_path: Path, ticker: str) -> dict[str, Any]:
     }
 
 
+# ── AI analysis ──────────────────────────────────────────────────────────────
+
+def analyze_with_ai(
+    ticker: str,
+    snapshot: dict[str, Any],
+    news: list[dict[str, Any]],
+    prior: dict[str, Any],
+    model: str,
+    api_key: str,
+    timeout: int = 90,
+) -> dict[str, Any]:
+    """Call OpenRouter/DeepSeek to generate analysis sections.
+
+    Returns a dict with keys: setup, bull_case, bear_case, key_risks,
+    direction, confidence, reasoning.
+    On any failure returns {"error": "description"} — never raises.
+    """
+    if not api_key:
+        return {"error": "OPENROUTER_API_KEY not set"}
+
+    prompt = _build_analysis_prompt(ticker, snapshot, news, prior)
+
+    try:
+        resp = requests.post(
+            _OPENROUTER_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                "response_format": {"type": "json_object"},
+                "temperature": 0.3,
+            },
+            timeout=timeout,
+        )
+    except Exception as exc:
+        return {"error": f"network error: {exc}"}
+
+    if resp.status_code != 200:
+        try:
+            detail = resp.json().get("error", {}).get("message", resp.text[:200])
+        except Exception:
+            detail = resp.text[:200]
+        return {"error": f"API returned {resp.status_code}: {detail}"}
+
+    try:
+        raw_text = resp.json()["choices"][0]["message"]["content"]
+    except Exception as exc:
+        return {"error": f"unexpected response shape: {exc}"}
+
+    return _parse_ai_response(raw_text)
+
+
+def _build_analysis_prompt(
+    ticker: str,
+    snapshot: dict[str, Any],
+    news: list[dict[str, Any]],
+    prior: dict[str, Any],
+) -> str:
+    """Build the compact market-data context block sent to the AI."""
+    lines: list[str] = [
+        f"Analyze {ticker} using the data below.",
+        "",
+        "Return JSON with exactly these keys:",
+        '  "setup"      – 2-3 sentences on current technical/fundamental setup',
+        '  "bull_case"  – 2-3 sentences, genuine steelmanned bull case',
+        '  "bear_case"  – 2-3 sentences, genuine steelmanned bear case',
+        '  "key_risks"  – 2-3 sentences on the most important risks and catalysts; flag upcoming earnings prominently',
+        '  "direction"  – exactly one of "up", "down", "flat"',
+        '  "confidence" – float 0.0–1.0',
+        '  "reasoning"  – 1-2 sentences summarizing the directional call',
+        "",
+        "Rules:",
+        "• Steelman both bull and bear cases genuinely — do not strawman either.",
+        '• "flat" is a fully valid and often correct call. If evidence is genuinely balanced, use "flat" and low confidence rather than manufacturing a lean.',
+        "• Base analysis only on the data below. Do not invent price targets, earnings estimates, or facts not present.",
+        "• If data is missing or thin, note the uncertainty rather than speculating.",
+        "• Flag the single most important upcoming catalyst (e.g. earnings date) prominently in key_risks.",
+        "• Frame as analysis for a human who makes all final decisions — not as advice.",
+        "",
+        "---",
+        "",
+        f"## {ticker} — Market Data",
+    ]
+
+    price = snapshot.get("current_price")
+    prev_close = snapshot.get("prev_close")
+    change = snapshot.get("day_change_pct")
+    if price:
+        price_str = f"Price: ${price:,.2f}"
+        if change is not None:
+            sign = "+" if change >= 0 else ""
+            price_str += f" ({sign}{change:.1%} today)"
+        if prev_close:
+            price_str += f" | Prev close: ${prev_close:,.2f}"
+        lines.append(price_str)
+
+    hi = snapshot.get("fifty_two_week_high")
+    lo = snapshot.get("fifty_two_week_low")
+    if hi and lo:
+        lines.append(f"52-week range: ${lo:,.2f} – ${hi:,.2f}")
+
+    vol = snapshot.get("volume")
+    avg_vol = snapshot.get("avg_volume")
+    vol_ratio = snapshot.get("volume_ratio")
+    if vol:
+        vol_str = f"Volume: {_fmt_num(vol)}"
+        if avg_vol:
+            vol_str += f" vs {_fmt_num(avg_vol)} avg"
+        if vol_ratio:
+            vol_str += f" ({vol_ratio:.1f}×)"
+        lines.append(vol_str)
+
+    parts = []
+    if snapshot.get("market_cap"):
+        parts.append(f"Market cap: {_fmt_money(snapshot['market_cap'])}")
+    pe_t = snapshot.get("pe_trailing")
+    pe_f = snapshot.get("pe_forward")
+    if pe_t or pe_f:
+        pe_parts = []
+        if pe_t:
+            pe_parts.append(f"trailing {pe_t:.1f}")
+        if pe_f:
+            pe_parts.append(f"forward {pe_f:.1f}")
+        parts.append(f"P/E: {' | '.join(pe_parts)}")
+    if parts:
+        lines.append(" | ".join(parts))
+
+    if snapshot.get("next_earnings"):
+        lines.append(f"Next earnings: {snapshot['next_earnings']}")
+
+    sector = snapshot.get("sector")
+    industry = snapshot.get("industry")
+    if sector:
+        lines.append(f"Sector: {sector}" + (f" — {industry}" if industry else ""))
+
+    lines.append("")
+    lines.append(f"## Recent News ({len(news)} items)")
+    if news:
+        for item in news[:8]:
+            title = item.get("title", "")
+            pub = item.get("publisher", "")
+            age = item.get("age", "")
+            meta = ""
+            if pub and age:
+                meta = f" ({pub}, {age})"
+            elif pub:
+                meta = f" ({pub})"
+            elif age:
+                meta = f" ({age})"
+            lines.append(f"- {title}{meta}")
+    else:
+        lines.append("No recent news available.")
+
+    lines.append("")
+    lines.append(f"## Prior Activity on {ticker}")
+
+    trades = prior.get("trades", [])
+    if trades:
+        lines.append(f"Trades ({len(trades)}):")
+        for t in trades:
+            action = str(t.get("action", "")).capitalize()
+            tdate = t.get("entry_date", "")
+            price_val = t.get("price")
+            price_s = f" @ ${price_val}" if price_val else ""
+            reason = t.get("reason", "")
+            lines.append(f"  {tdate} {action}{price_s} — {reason}")
+    else:
+        lines.append("Trades: none")
+
+    preds = prior.get("predictions", [])
+    if preds:
+        lines.append(f"Predictions ({len(preds)}):")
+        for p in preds:
+            pdate = p.get("prediction_date", "")
+            direction = str(p.get("direction", "")).upper()
+            conf = p.get("confidence")
+            conf_s = f" {int(float(conf) * 100)}%" if conf is not None else ""
+            status = p.get("status", "")
+            status_s = f" [{status}]" if status else ""
+            reasoning = p.get("reasoning", "")
+            lines.append(f"  {pdate} {direction}{conf_s}{status_s} — {reasoning}")
+    else:
+        lines.append("Predictions: none")
+
+    prior_res = prior.get("prior_research", [])
+    if prior_res:
+        lines.append(f"Prior research: {', '.join(prior_res)}")
+    else:
+        lines.append("Prior research: none")
+
+    return "\n".join(lines)
+
+
+def _parse_ai_response(raw_text: str) -> dict[str, Any]:
+    """Parse the AI JSON response into an analysis dict.
+
+    Tries json.loads first; falls back to extracting the first {...} block
+    from markdown fences or prose. Returns {"error": "..."} on failure.
+    """
+    required = {"setup", "bull_case", "bear_case", "key_risks",
+                "direction", "confidence", "reasoning"}
+
+    def _try_parse(text: str) -> Optional[dict[str, Any]]:
+        try:
+            return json.loads(text)
+        except Exception:
+            return None
+
+    result = _try_parse(raw_text.strip())
+
+    if result is None:
+        fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw_text, re.DOTALL)
+        if fence:
+            result = _try_parse(fence.group(1))
+
+    if result is None:
+        start = raw_text.find("{")
+        end = raw_text.rfind("}")
+        if start != -1 and end > start:
+            result = _try_parse(raw_text[start : end + 1])
+
+    if result is None:
+        return {"error": "could not parse AI response as JSON"}
+
+    if not isinstance(result, dict):
+        return {"error": "AI response was not a JSON object"}
+
+    missing = required - result.keys()
+    if missing:
+        return {"error": f"AI response missing keys: {', '.join(sorted(missing))}"}
+
+    direction = str(result.get("direction", "")).lower().strip()
+    if direction not in ("up", "down", "flat"):
+        return {"error": f"AI returned invalid direction: {direction!r}"}
+
+    try:
+        confidence = float(result["confidence"])
+        confidence = max(0.0, min(1.0, confidence))
+    except (TypeError, ValueError):
+        return {"error": f"AI returned invalid confidence: {result['confidence']!r}"}
+
+    return {
+        "setup": str(result.get("setup", "")),
+        "bull_case": str(result.get("bull_case", "")),
+        "bear_case": str(result.get("bear_case", "")),
+        "key_risks": str(result.get("key_risks", "")),
+        "direction": direction,
+        "confidence": confidence,
+        "reasoning": str(result.get("reasoning", "")),
+    }
+
+
 # ── note builder ─────────────────────────────────────────────────────────────
 
 def _build_research_note(
@@ -249,6 +541,7 @@ def _build_research_note(
     snapshot: dict[str, Any],
     news: list[dict[str, Any]],
     prior: dict[str, Any],
+    ai_analysis: Optional[dict[str, Any]] = None,
 ) -> str:
     lines: list[str] = []
 
@@ -390,22 +683,78 @@ def _build_research_note(
                 lines.append(f"- [[{r}]]")
             lines.append("")
 
-    # ── Analysis sections (manual fill-in now, LLM later) ────────────────────
-    for section in ["Setup", "Bull case", "Bear case", "Key risks"]:
-        lines += [f"## {section}", "", ""]
+    # ── Analysis sections ─────────────────────────────────────────────────────
+    if ai_analysis is None:
+        for section in ["Setup", "Bull case", "Bear case", "Key risks"]:
+            lines += [f"## {section}", "", ""]
+    elif "error" in ai_analysis:
+        error_msg = f"> AI analysis unavailable: {ai_analysis['error']}"
+        for section in ["Setup", "Bull case", "Bear case", "Key risks"]:
+            lines += [f"## {section}", "", error_msg, ""]
+    else:
+        for heading, key in [
+            ("Setup", "setup"),
+            ("Bull case", "bull_case"),
+            ("Bear case", "bear_case"),
+            ("Key risks", "key_risks"),
+        ]:
+            lines += [f"## {heading}", "", ai_analysis[key], ""]
+
+        lines += [
+            "",
+            "---",
+            "",
+            "## AI's suggested call",
+            "",
+            f"Direction: {ai_analysis['direction']}  ",
+            f"Confidence: {ai_analysis['confidence']:.2f}  ",
+            f"Reasoning: {ai_analysis['reasoning']}",
+            "",
+        ]
 
     # ── My call ───────────────────────────────────────────────────────────────
-    lines += [
-        "## My call",
-        "",
-        "Complete your analysis above, then log a prediction:",
-        "",
-        f"```",
-        f"wf log-prediction --ticker {ticker} --direction [up/down/flat] "
-        f"--timeframe \"...\" --confidence 0.0 --reasoning \"...\" --resolve-by YYYY-MM-DD",
-        f"```",
-        "",
-    ]
+    if ai_analysis is not None and "error" not in ai_analysis:
+        lines += [
+            "## My call",
+            "",
+            "**My take:** ",
+            "",
+            "→ Log when ready:",
+            "",
+            "```",
+            f"wf log-prediction --ticker {ticker} "
+            f"--direction {ai_analysis['direction']} "
+            f"--confidence {ai_analysis['confidence']:.2f} "
+            f'--resolve-by YYYY-MM-DD --reasoning "..."',
+            "```",
+            "",
+        ]
+    elif ai_analysis is not None:
+        lines += [
+            "## My call",
+            "",
+            "**My take:** ",
+            "",
+            "→ Log when ready:",
+            "",
+            "```",
+            f"wf log-prediction --ticker {ticker} --direction [up/down/flat] "
+            f'--confidence 0.0 --resolve-by YYYY-MM-DD --reasoning "..."',
+            "```",
+            "",
+        ]
+    else:
+        lines += [
+            "## My call",
+            "",
+            "Complete your analysis above, then log a prediction:",
+            "",
+            "```",
+            f"wf log-prediction --ticker {ticker} --direction [up/down/flat] "
+            f'--timeframe "..." --confidence 0.0 --reasoning "..." --resolve-by YYYY-MM-DD',
+            "```",
+            "",
+        ]
 
     return "\n".join(lines)
 

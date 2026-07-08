@@ -21,7 +21,7 @@ from typing import Optional
 
 import click
 
-from weaver.config import get_vault_path, load_config
+from weaver.config import get_analyze_model, get_openrouter_timeout, get_vault_path, load_config
 from weaver.journal import VALID_ACTIONS, VALID_HORIZONS, log_trade
 from weaver.predictions import (
     VALID_DIRECTIONS,
@@ -380,24 +380,54 @@ def resolve_predictions_cmd(
     default=None,
     help="Research date as YYYY-MM-DD (defaults to today).",
 )
+@click.option(
+    "--analyze",
+    is_flag=True,
+    default=False,
+    help="Fill analysis sections with DeepSeek via OpenRouter (requires OPENROUTER_API_KEY in .env).",
+)
 @click.pass_context
 def research_cmd(
     ctx: click.Context,
     ticker: str,
     research_date: Optional[datetime],
+    analyze: bool,
 ) -> None:
-    """Fetch market data for a ticker and write a research note to Trading/Research/."""
+    """Fetch market data for a ticker and write a research note to Trading/Research/.
+
+    Without --analyze (default): data sections filled, analysis sections left blank.
+    With --analyze: DeepSeek fills Setup/Bull/Bear/Key risks and adds a suggested call.
+    """
+    import os
     from weaver.research import generate_research_note
 
     vault_path = _vault(ctx)
     rd = research_date.date() if research_date else None
+    config = load_config(ctx.obj["config_path"])
+
+    api_key: Optional[str] = None
+    if analyze:
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        if not api_key:
+            click.echo(
+                "Error: --analyze requires OPENROUTER_API_KEY to be set in .env",
+                err=True,
+            )
+            sys.exit(1)
 
     click.echo(f"Fetching data for {ticker.upper()}...")
+    if analyze:
+        click.echo("Analyzing with DeepSeek (this may take up to a minute)...")
+
     try:
         filepath = generate_research_note(
             vault_path=vault_path,
             ticker=ticker,
             research_date=rd,
+            analyze=analyze,
+            analyze_model=get_analyze_model(config),
+            openrouter_api_key=api_key,
+            openrouter_timeout=get_openrouter_timeout(config),
         )
     except Exception as exc:
         click.echo(f"Error: {exc}", err=True)

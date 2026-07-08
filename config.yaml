@@ -38,3 +38,7 @@ data:
     retry_attempts: 3
   edgar:
     retry_attempts: 3
+
+ai:
+  analyze_model: deepseek/deepseek-v4-pro
+  openrouter_timeout_seconds: 90

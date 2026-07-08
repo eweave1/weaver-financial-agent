@@ -2,10 +2,13 @@
 
 Network calls (fetch_snapshot, fetch_news) are bypassed via injection.
 fetch_prior_views and note generation are tested with tmp_path.
+OpenRouter API calls are mocked — no real network or cost in CI.
 """
 
+import json
 from datetime import date, datetime, timezone
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -13,9 +16,11 @@ from weaver.journal import log_trade
 from weaver.predictions import log_prediction
 from weaver.research import (
     _fmt_money,
-    _parse_news_item,
     _fmt_num,
     _format_age,
+    _parse_ai_response,
+    _parse_news_item,
+    analyze_with_ai,
     fetch_prior_views,
     generate_research_note,
 )
@@ -354,3 +359,191 @@ class TestParseNewsItem:
         }
         parsed = _parse_news_item(item)
         assert parsed["url"] == "https://canonical.example.com"
+
+
+# ── AI analysis ───────────────────────────────────────────────────────────────
+
+_GOOD_AI = {
+    "setup": "NVDA is trading near the top of its 52-week range with elevated valuation.",
+    "bull_case": "AI infrastructure spending remains robust; NVDA holds pricing power in data-center GPUs.",
+    "bear_case": "Valuation is stretched and any guidance miss into earnings could trigger a sharp sell-off.",
+    "key_risks": "Next earnings on 2026-08-15 is the critical binary. Consensus expects continued GPU demand strength.",
+    "direction": "up",
+    "confidence": 0.6,
+    "reasoning": "Near-term AI tailwinds support the bull case, but the setup into earnings is high-risk.",
+}
+
+
+class TestAnalyzeWithAI:
+    def test_happy_path_fills_sections(self, tmp_path: Path) -> None:
+        fp = generate_research_note(
+            tmp_path, "NVDA", TODAY,
+            _snapshot=_SNAPSHOT, _news=[],
+            analyze=True, _ai_analysis=_GOOD_AI,
+        )
+        content = fp.read_text()
+        assert "AI infrastructure spending" in content
+        assert "Valuation is stretched" in content
+        assert "Next earnings on 2026-08-15" in content
+
+    def test_suggested_call_section_present(self, tmp_path: Path) -> None:
+        fp = generate_research_note(
+            tmp_path, "NVDA", TODAY,
+            _snapshot=_SNAPSHOT, _news=[],
+            analyze=True, _ai_analysis=_GOOD_AI,
+        )
+        content = fp.read_text()
+        assert "## AI's suggested call" in content
+        assert "Direction: up" in content
+        assert "Confidence: 0.60" in content
+        assert "Near-term AI tailwinds" in content
+
+    def test_my_take_line_present_on_success(self, tmp_path: Path) -> None:
+        fp = generate_research_note(
+            tmp_path, "NVDA", TODAY,
+            _snapshot=_SNAPSHOT, _news=[],
+            analyze=True, _ai_analysis=_GOOD_AI,
+        )
+        assert "**My take:**" in fp.read_text()
+
+    def test_log_prediction_template_prefilled(self, tmp_path: Path) -> None:
+        fp = generate_research_note(
+            tmp_path, "NVDA", TODAY,
+            _snapshot=_SNAPSHOT, _news=[],
+            analyze=True, _ai_analysis=_GOOD_AI,
+        )
+        content = fp.read_text()
+        assert "--direction up" in content
+        assert "--confidence 0.60" in content
+
+    def test_api_error_writes_unavailable_in_sections(self, tmp_path: Path) -> None:
+        fp = generate_research_note(
+            tmp_path, "NVDA", TODAY,
+            _snapshot=_SNAPSHOT, _news=[],
+            analyze=True, _ai_analysis={"error": "network timeout"},
+        )
+        content = fp.read_text()
+        assert "AI analysis unavailable" in content
+        assert "network timeout" in content
+        assert "## Setup" in content
+        assert "## Bull case" in content
+
+    def test_api_error_still_has_my_take_line(self, tmp_path: Path) -> None:
+        fp = generate_research_note(
+            tmp_path, "NVDA", TODAY,
+            _snapshot=_SNAPSHOT, _news=[],
+            analyze=True, _ai_analysis={"error": "API 429"},
+        )
+        assert "**My take:**" in fp.read_text()
+
+    def test_api_error_no_suggested_call_section(self, tmp_path: Path) -> None:
+        fp = generate_research_note(
+            tmp_path, "NVDA", TODAY,
+            _snapshot=_SNAPSHOT, _news=[],
+            analyze=True, _ai_analysis={"error": "rate limited"},
+        )
+        assert "## AI's suggested call" not in fp.read_text()
+
+    def test_analyze_false_blank_sections(self, tmp_path: Path) -> None:
+        fp = generate_research_note(
+            tmp_path, "NVDA", TODAY, _snapshot=_SNAPSHOT, _news=[],
+        )
+        content = fp.read_text()
+        assert "## Setup" in content
+        assert "## AI's suggested call" not in content
+        assert "**My take:**" not in content
+        assert "AI analysis unavailable" not in content
+
+    def test_analyze_false_preserves_existing_my_call(self, tmp_path: Path) -> None:
+        fp = generate_research_note(
+            tmp_path, "NVDA", TODAY, _snapshot=_SNAPSHOT, _news=[],
+        )
+        content = fp.read_text()
+        assert "Complete your analysis above" in content
+        assert "wf log-prediction" in content
+
+    # ── _parse_ai_response ────────────────────────────────────────────────────
+
+    def test_parse_clean_json(self) -> None:
+        result = _parse_ai_response(json.dumps(_GOOD_AI))
+        assert result["direction"] == "up"
+        assert result["confidence"] == 0.6
+        assert "error" not in result
+
+    def test_parse_json_in_markdown_fence(self) -> None:
+        raw = f"Sure!\n```json\n{json.dumps(_GOOD_AI)}\n```"
+        result = _parse_ai_response(raw)
+        assert result["direction"] == "up"
+        assert "error" not in result
+
+    def test_parse_json_embedded_in_prose(self) -> None:
+        raw = f"Here is my analysis: {json.dumps(_GOOD_AI)} Hope that helps."
+        result = _parse_ai_response(raw)
+        assert result["direction"] == "up"
+        assert "error" not in result
+
+    def test_parse_bad_input_returns_error(self) -> None:
+        result = _parse_ai_response("This is not JSON at all.")
+        assert "error" in result
+
+    def test_parse_missing_keys_returns_error(self) -> None:
+        result = _parse_ai_response(json.dumps({"direction": "up", "confidence": 0.5}))
+        assert "error" in result
+        assert "missing keys" in result["error"]
+
+    def test_parse_invalid_direction_returns_error(self) -> None:
+        bad = {**_GOOD_AI, "direction": "sideways"}
+        result = _parse_ai_response(json.dumps(bad))
+        assert "error" in result
+        assert "direction" in result["error"]
+
+    def test_parse_confidence_clamped_to_range(self) -> None:
+        over = {**_GOOD_AI, "confidence": 1.5}
+        result = _parse_ai_response(json.dumps(over))
+        assert result["confidence"] == 1.0
+
+    # ── analyze_with_ai (mocked) ──────────────────────────────────────────────
+
+    def test_network_error_returns_error_dict(self) -> None:
+        import requests as req_module
+        with patch("weaver.research.requests.post",
+                   side_effect=req_module.exceptions.ConnectionError("refused")):
+            result = analyze_with_ai("NVDA", {}, [], {}, "deepseek/deepseek-v4-pro", "fake-key")
+        assert "error" in result
+        assert "network" in result["error"].lower()
+
+    def test_non_200_status_returns_error_dict(self) -> None:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 429
+        mock_resp.json.return_value = {"error": {"message": "Rate limit exceeded"}}
+        with patch("weaver.research.requests.post", return_value=mock_resp):
+            result = analyze_with_ai("NVDA", {}, [], {}, "deepseek/deepseek-v4-pro", "fake-key")
+        assert "error" in result
+        assert "429" in result["error"]
+
+    def test_bad_json_in_response_returns_error_dict(self) -> None:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": "Sorry, cannot help with that."}}]
+        }
+        with patch("weaver.research.requests.post", return_value=mock_resp):
+            result = analyze_with_ai("NVDA", {}, [], {}, "deepseek/deepseek-v4-pro", "fake-key")
+        assert "error" in result
+
+    def test_missing_api_key_returns_error_dict(self) -> None:
+        result = analyze_with_ai("NVDA", {}, [], {}, "deepseek/deepseek-v4-pro", api_key="")
+        assert "error" in result
+        assert "OPENROUTER_API_KEY" in result["error"]
+
+    def test_successful_api_call_returns_parsed_analysis(self) -> None:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": json.dumps(_GOOD_AI)}}]
+        }
+        with patch("weaver.research.requests.post", return_value=mock_resp):
+            result = analyze_with_ai("NVDA", _SNAPSHOT, [], {}, "deepseek/deepseek-v4-pro", "fake-key")
+        assert result["direction"] == "up"
+        assert result["confidence"] == 0.6
+        assert "error" not in result
