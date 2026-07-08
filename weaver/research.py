@@ -55,7 +55,9 @@ def generate_research_note(
     research_dir.mkdir(parents=True, exist_ok=True)
 
     snapshot = _snapshot if _snapshot is not None else fetch_snapshot(ticker)
-    news = _news if _news is not None else fetch_news(ticker)
+    news = _news if _news is not None else fetch_news(
+        ticker, company_name=snapshot.get("name", "")
+    )
     prior = fetch_prior_views(vault_path, ticker)
 
     ai_analysis: Optional[dict[str, Any]] = None
@@ -163,10 +165,18 @@ def fetch_snapshot(ticker: str) -> dict[str, Any]:
     return {}
 
 
-def fetch_news(ticker: str, limit: int = 8) -> list[dict[str, Any]]:
-    """Fetch recent news headlines from yfinance.
+def fetch_news(
+    ticker: str,
+    limit: int = 8,
+    company_name: str = "",
+) -> list[dict[str, Any]]:
+    """Fetch recent news headlines from yfinance, filtered to this ticker.
 
-    Returns a list of dicts with keys: title, publisher, age, url.
+    Parses all raw items returned by yfinance, drops articles that don't
+    mention the ticker symbol or company name in the headline, then returns
+    the first `limit` that pass. This removes the general market/sector
+    articles Yahoo Finance occasionally mixes into ticker feeds.
+
     Returns an empty list on failure rather than raising.
     """
     import yfinance as yf
@@ -175,12 +185,55 @@ def fetch_news(ticker: str, limit: int = 8) -> list[dict[str, Any]]:
         try:
             t = yf.Ticker(ticker)
             raw = t.news or []
-            return [_parse_news_item(item) for item in raw[:limit] if item]
+            parsed = [_parse_news_item(item) for item in raw if item]
+            relevant = [
+                item for item in parsed
+                if _is_relevant_to_ticker(item["title"], ticker, company_name)
+            ]
+            return relevant[:limit]
         except Exception:
             if attempt < 2:
                 time.sleep(2 ** attempt)
 
     return []
+
+
+_GENERIC_NAME_WORDS = {
+    "corp", "inc", "ltd", "llc", "plc", "group", "trust", "fund", "funds",
+    "index", "etf", "about", "after", "their", "which", "would", "could",
+}
+
+
+def _is_relevant_to_ticker(
+    title: str,
+    ticker: str,
+    company_name: str = "",
+) -> bool:
+    """Return True if the headline is relevant to the given ticker.
+
+    Accepts articles that mention the ticker symbol (word-boundary match) or
+    contain a distinctive word from the company name (4+ chars, not generic).
+    Rejects empty titles and articles with no connection to the ticker.
+    """
+    if not title:
+        return False
+
+    title_lower = title.lower()
+
+    if re.search(r"\b" + re.escape(ticker.lower()) + r"\b", title_lower):
+        return True
+
+    if company_name:
+        words = [
+            w.lower().rstrip(".,")
+            for w in company_name.split()
+            if len(w.rstrip(".,")) >= 4
+            and w.lower().rstrip(".,") not in _GENERIC_NAME_WORDS
+        ]
+        if any(re.search(r"\b" + re.escape(w) + r"\b", title_lower) for w in words):
+            return True
+
+    return False
 
 
 def _parse_news_item(item: dict[str, Any]) -> dict[str, Any]:

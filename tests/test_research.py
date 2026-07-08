@@ -18,9 +18,11 @@ from weaver.research import (
     _fmt_money,
     _fmt_num,
     _format_age,
+    _is_relevant_to_ticker,
     _parse_ai_response,
     _parse_news_item,
     analyze_with_ai,
+    fetch_news,
     fetch_prior_views,
     generate_research_note,
 )
@@ -359,6 +361,98 @@ class TestParseNewsItem:
         }
         parsed = _parse_news_item(item)
         assert parsed["url"] == "https://canonical.example.com"
+
+
+# ── news relevance filtering ──────────────────────────────────────────────────
+
+class TestIsRelevantToTicker:
+    def test_ticker_symbol_in_title_passes(self) -> None:
+        assert _is_relevant_to_ticker("NVDA earnings beat estimates", "NVDA") is True
+
+    def test_ticker_lowercase_in_title_passes(self) -> None:
+        assert _is_relevant_to_ticker("Why nvda is the AI trade", "NVDA") is True
+
+    def test_company_name_word_in_title_passes(self) -> None:
+        assert _is_relevant_to_ticker("NVIDIA announces new Blackwell chip", "NVDA", "NVIDIA Corp") is True
+
+    def test_multi_word_company_name_partial_match(self) -> None:
+        assert _is_relevant_to_ticker("Microsoft expands Azure AI", "MSFT", "Microsoft Corp") is True
+
+    def test_unrelated_headline_rejected(self) -> None:
+        assert _is_relevant_to_ticker("McCormick raises dividend outlook", "NVDA", "NVIDIA Corp") is False
+
+    def test_unrelated_headline_no_company_name(self) -> None:
+        assert _is_relevant_to_ticker("Netflix beats subscriber forecast", "NVDA") is False
+
+    def test_empty_title_rejected(self) -> None:
+        assert _is_relevant_to_ticker("", "NVDA", "NVIDIA Corp") is False
+
+    def test_ticker_word_boundary_not_partial_match(self) -> None:
+        # "METADATA" should not match ticker "META"
+        assert _is_relevant_to_ticker("Metadata standards evolve", "META", "Meta Platforms") is False
+
+    def test_ticker_possessive_still_matches(self) -> None:
+        # "NVDA's" should match — apostrophe is a word boundary
+        assert _is_relevant_to_ticker("NVDA's options activity spikes", "NVDA") is True
+
+    def test_generic_company_words_not_matched(self) -> None:
+        # "Corp" and "Trust" are in the generic-words list — shouldn't cause false positives
+        assert _is_relevant_to_ticker("Corporate trust issues in banking", "NVDA", "NVIDIA Corp") is False
+
+    def test_general_ai_headline_without_ticker_rejected(self) -> None:
+        # Reproduces the real-world noise case: general AI article in NVDA feed
+        assert _is_relevant_to_ticker(
+            "What's next for AI and Big Tech in the second half of 2026?",
+            "NVDA", "NVIDIA Corp",
+        ) is False
+
+    def test_rivian_headline_in_nvda_feed_rejected(self) -> None:
+        assert _is_relevant_to_ticker("Rivian stock slides after recall", "NVDA", "NVIDIA Corp") is False
+
+
+class TestFetchNewsFiltering:
+    """fetch_news should return only ticker-relevant articles."""
+
+    def _make_raw_item(self, title: str) -> dict:
+        return {"content": {"title": title, "pubDate": "2026-07-07T12:00:00Z",
+                             "provider": {"displayName": "Reuters"},
+                             "canonicalUrl": {"url": "https://example.com"}}}
+
+    def test_unrelated_articles_filtered_out(self) -> None:
+        raw = [
+            self._make_raw_item("NVDA rallies on strong earnings"),
+            self._make_raw_item("McCormick raises dividend outlook"),
+            self._make_raw_item("Netflix beats subscriber forecast"),
+            self._make_raw_item("NVIDIA unveils next-gen data-center GPU"),
+        ]
+        mock_ticker = MagicMock()
+        mock_ticker.news = raw
+        with patch("yfinance.Ticker", return_value=mock_ticker):
+            result = fetch_news("NVDA", company_name="NVIDIA Corp")
+        titles = [item["title"] for item in result]
+        assert "NVDA rallies on strong earnings" in titles
+        assert "NVIDIA unveils next-gen data-center GPU" in titles
+        assert "McCormick raises dividend outlook" not in titles
+        assert "Netflix beats subscriber forecast" not in titles
+
+    def test_limit_applied_after_filtering(self) -> None:
+        raw = [self._make_raw_item(f"NVDA item {i}") for i in range(20)]
+        mock_ticker = MagicMock()
+        mock_ticker.news = raw
+        with patch("yfinance.Ticker", return_value=mock_ticker):
+            result = fetch_news("NVDA", limit=5, company_name="NVIDIA Corp")
+        assert len(result) == 5
+
+    def test_all_filtered_returns_empty_list(self) -> None:
+        raw = [
+            self._make_raw_item("McCormick raises dividend"),
+            self._make_raw_item("Rivian recall announced"),
+        ]
+        mock_ticker = MagicMock()
+        mock_ticker.news = raw
+        with patch("yfinance.Ticker", return_value=mock_ticker):
+            result = fetch_news("NVDA", company_name="NVIDIA Corp")
+        assert result == []
 
 
 # ── AI analysis ───────────────────────────────────────────────────────────────
