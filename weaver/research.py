@@ -11,15 +11,21 @@ from __future__ import annotations
 import json
 import re
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time as dtime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 import requests
 
 from weaver.predictions import _parse_frontmatter
 
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+_ET = ZoneInfo("America/New_York")
+_MARKET_OPEN_MINUTES = 9 * 60 + 30   # 570  (9:30 AM ET)
+_MARKET_CLOSE_MINUTES = 16 * 60       # 960  (4:00 PM ET)
+_TRADING_DAY_MINUTES = 390
 
 _SYSTEM_PROMPT = (
     "You are a financial research assistant analyzing stocks for a human trader "
@@ -139,6 +145,17 @@ def fetch_snapshot(ticker: str) -> dict[str, Any]:
                 result["avg_volume"] = avg_vol
             if vol and avg_vol:
                 result["volume_ratio"] = vol / avg_vol
+
+            if vol:
+                now_et = datetime.now(tz=_ET)
+                projected = _project_intraday_volume(int(vol), now_et)
+                if projected is not None:
+                    result["volume_projected"] = projected
+                    result["snapshot_time_et"] = (
+                        f"{now_et.hour}:{now_et.minute:02d} ET"
+                    )
+                    if avg_vol:
+                        result["volume_ratio_projected"] = projected / avg_vol
 
             if info.get("marketCap"):
                 result["market_cap"] = info["marketCap"]
@@ -437,13 +454,19 @@ def _build_analysis_prompt(
 
     vol = snapshot.get("volume")
     avg_vol = snapshot.get("avg_volume")
-    vol_ratio = snapshot.get("volume_ratio")
     if vol:
-        vol_str = f"Volume: {_fmt_num(vol)}"
+        vol_str = f"Volume: {_fmt_num(vol)} current"
+        projected = snapshot.get("volume_projected")
+        if projected:
+            vol_str += f" → ~{_fmt_num(projected)} projected"
         if avg_vol:
             vol_str += f" vs {_fmt_num(avg_vol)} avg"
-        if vol_ratio:
-            vol_str += f" ({vol_ratio:.1f}×)"
+        ratio = snapshot.get("volume_ratio_projected") or snapshot.get("volume_ratio")
+        if ratio:
+            vol_str += f" ({ratio:.1f}×)"
+        capture = snapshot.get("snapshot_time_et")
+        if capture:
+            vol_str += f" [captured {capture}]"
         lines.append(vol_str)
 
     parts = []
@@ -634,13 +657,19 @@ def _build_research_note(
 
         vol = snapshot.get("volume")
         avg_vol = snapshot.get("avg_volume")
-        vol_ratio = snapshot.get("volume_ratio")
         if vol:
             vol_str = f"**Volume:** {_fmt_num(vol)}"
+            projected = snapshot.get("volume_projected")
+            if projected:
+                vol_str += f" → ~{_fmt_num(projected)} projected"
             if avg_vol:
                 vol_str += f" vs {_fmt_num(avg_vol)} avg"
-            if vol_ratio:
-                vol_str += f" ({vol_ratio:.1f}x)"
+            ratio = snapshot.get("volume_ratio_projected") or snapshot.get("volume_ratio")
+            if ratio:
+                vol_str += f" ({ratio:.1f}×)"
+            capture = snapshot.get("snapshot_time_et")
+            if capture:
+                vol_str += f" — {capture}"
             lines.append(vol_str + "  ")
 
         if snapshot.get("market_cap"):
@@ -813,6 +842,23 @@ def _build_research_note(
 
 
 # ── private helpers ───────────────────────────────────────────────────────────
+
+def _project_intraday_volume(current_vol: int, now_et: datetime) -> Optional[int]:
+    """Project a partial intraday volume to an estimated full-day total.
+
+    Uses linear extrapolation based on how much of the 9:30–4:00 ET session
+    has elapsed. Returns None when the market is closed or at the open tick
+    (division by zero). Works well from ~10 AM onward; early morning estimates
+    are noisier due to opening-auction volume spikes.
+    """
+    if now_et.weekday() >= 5:
+        return None
+    minutes_since_midnight = now_et.hour * 60 + now_et.minute
+    elapsed = minutes_since_midnight - _MARKET_OPEN_MINUTES
+    if elapsed <= 0 or minutes_since_midnight >= _MARKET_CLOSE_MINUTES:
+        return None
+    fraction = elapsed / _TRADING_DAY_MINUTES
+    return int(current_vol / fraction)
 
 def _get_next_earnings(ticker_obj: Any) -> Optional[str]:
     """Return the next earnings date as a string, or None if unavailable."""

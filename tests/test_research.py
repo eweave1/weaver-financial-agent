@@ -14,6 +14,8 @@ import pytest
 
 from weaver.journal import log_trade
 from weaver.predictions import log_prediction
+from zoneinfo import ZoneInfo
+
 from weaver.research import (
     _fmt_money,
     _fmt_num,
@@ -21,11 +23,14 @@ from weaver.research import (
     _is_relevant_to_ticker,
     _parse_ai_response,
     _parse_news_item,
+    _project_intraday_volume,
     analyze_with_ai,
     fetch_news,
     fetch_prior_views,
     generate_research_note,
 )
+
+_ET = ZoneInfo("America/New_York")
 
 TODAY = date(2026, 7, 1)
 FUTURE = date(2099, 1, 1)
@@ -361,6 +366,87 @@ class TestParseNewsItem:
         }
         parsed = _parse_news_item(item)
         assert parsed["url"] == "https://canonical.example.com"
+
+
+# ── intraday volume projection ────────────────────────────────────────────────
+
+_SNAPSHOT_WITH_PROJECTION = {
+    **_SNAPSHOT,
+    "volume_projected": 52_000_000,
+    "volume_ratio_projected": 1.37,
+    "snapshot_time_et": "11:00 ET",
+}
+
+
+class TestProjectIntradayVolume:
+    def _et(self, year: int, month: int, day: int, hour: int, minute: int = 0) -> datetime:
+        return datetime(year, month, day, hour, minute, tzinfo=_ET)
+
+    def test_projects_at_11am_weekday(self) -> None:
+        # Wednesday 11:00 AM ET — 90 min of 390 elapsed = 23.08%
+        now = self._et(2026, 7, 8, 11, 0)
+        result = _project_intraday_volume(12_000_000, now)
+        assert result is not None
+        # 12M / (90/390) ≈ 52M
+        assert 50_000_000 < result < 55_000_000
+
+    def test_projects_at_2pm(self) -> None:
+        # 2:00 PM ET — 270 min of 390 elapsed = 69.2%
+        now = self._et(2026, 7, 8, 14, 0)
+        result = _project_intraday_volume(30_000_000, now)
+        assert result is not None
+        # 30M / (270/390) ≈ 43.3M
+        assert 42_000_000 < result < 45_000_000
+
+    def test_returns_none_before_market_open(self) -> None:
+        now = self._et(2026, 7, 8, 9, 29)
+        assert _project_intraday_volume(1_000_000, now) is None
+
+    def test_returns_none_at_market_open(self) -> None:
+        # elapsed == 0 → division by zero guard
+        now = self._et(2026, 7, 8, 9, 30)
+        assert _project_intraday_volume(1_000_000, now) is None
+
+    def test_returns_none_at_or_after_close(self) -> None:
+        now = self._et(2026, 7, 8, 16, 0)
+        assert _project_intraday_volume(40_000_000, now) is None
+
+    def test_returns_none_on_saturday(self) -> None:
+        now = self._et(2026, 7, 11, 11, 0)  # Saturday
+        assert _project_intraday_volume(1_000_000, now) is None
+
+    def test_returns_none_on_sunday(self) -> None:
+        now = self._et(2026, 7, 12, 11, 0)  # Sunday
+        assert _project_intraday_volume(1_000_000, now) is None
+
+    def test_projected_volume_in_note(self, tmp_path: Path) -> None:
+        fp = generate_research_note(
+            tmp_path, "NVDA", TODAY,
+            _snapshot=_SNAPSHOT_WITH_PROJECTION, _news=[],
+        )
+        content = fp.read_text()
+        assert "projected" in content
+        assert "11:00 ET" in content
+
+    def test_projected_volume_in_ai_prompt(self) -> None:
+        from weaver.research import _build_analysis_prompt
+        prompt = _build_analysis_prompt(
+            "NVDA", _SNAPSHOT_WITH_PROJECTION, [],
+            {"trades": [], "predictions": [], "prior_research": []},
+        )
+        assert "projected" in prompt
+        assert "11:00 ET" in prompt
+
+    def test_no_projection_when_market_closed(self, tmp_path: Path) -> None:
+        # Snapshot without volume_projected (market closed at fetch time)
+        fp = generate_research_note(
+            tmp_path, "NVDA", TODAY,
+            _snapshot=_SNAPSHOT, _news=[],
+        )
+        content = fp.read_text()
+        # Should still show volume, just without projection
+        assert "Volume" in content
+        assert "projected" not in content
 
 
 # ── news relevance filtering ──────────────────────────────────────────────────
