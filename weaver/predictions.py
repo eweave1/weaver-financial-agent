@@ -30,11 +30,13 @@ def log_prediction(
     reasoning: str,
     resolve_by: date,
     prediction_date: Optional[date] = None,
+    trigger: Optional[float] = None,
 ) -> Path:
     """Write a prediction entry to Trading/Predictions/ in the Obsidian vault.
 
     confidence is a float in [0.0, 1.0].
     resolve_by must be after prediction_date (or today if prediction_date is None).
+    trigger is an optional explicit price level for the entry condition.
 
     Returns the path of the written file.
     """
@@ -42,6 +44,8 @@ def log_prediction(
         raise ValueError(f"direction must be one of {VALID_DIRECTIONS}, got {direction!r}")
     if not 0.0 <= confidence <= 1.0:
         raise ValueError(f"confidence must be between 0.0 and 1.0, got {confidence}")
+    if trigger is not None and trigger <= 0:
+        raise ValueError(f"trigger must be a positive price, got {trigger}")
 
     pred_date = prediction_date or date.today()
     if resolve_by <= pred_date:
@@ -66,6 +70,7 @@ def log_prediction(
         reasoning=reasoning,
         resolve_by=resolve_by,
         prediction_date=pred_date,
+        trigger=trigger,
     )
     filepath.write_text(content, encoding="utf-8")
     return filepath
@@ -96,7 +101,7 @@ def list_pending_resolutions(
         resolve_by = _coerce_date(resolve_by_raw)
         if resolve_by is None or resolve_by > check_date:
             continue
-        pending.append({
+        entry: dict = {
             "file": md_file,
             "ticker": fm.get("ticker"),
             "direction": fm.get("direction"),
@@ -105,7 +110,13 @@ def list_pending_resolutions(
             "reasoning": fm.get("reasoning"),
             "resolve_by": resolve_by,
             "prediction_date": _coerce_date(fm.get("prediction_date")),
-        })
+        }
+        if fm.get("trigger") is not None:
+            try:
+                entry["trigger"] = float(fm["trigger"])
+            except (TypeError, ValueError):
+                pass
+        pending.append(entry)
     return pending
 
 
@@ -161,6 +172,7 @@ def _build_prediction_note(
     reasoning: str,
     resolve_by: date,
     prediction_date: date,
+    trigger: Optional[float] = None,
 ) -> str:
     confidence_pct = int(confidence * 100)
     fm: list[str] = [
@@ -173,8 +185,10 @@ def _build_prediction_note(
         f"prediction_date: {prediction_date}",
         f'reasoning: "{_esc(reasoning)}"',
         "status: open",
-        "---",
     ]
+    if trigger is not None:
+        fm.append(f"trigger: {trigger}")
+    fm.append("---")
 
     body: list[str] = [
         f"# {prediction_date} {ticker} — {direction.upper()} ({confidence_pct}% confidence)",
@@ -182,6 +196,10 @@ def _build_prediction_note(
         f"**Timeframe:** {timeframe}  ",
         f"**Resolve by:** {resolve_by}  ",
         f"**Confidence:** {confidence_pct}%  ",
+    ]
+    if trigger is not None:
+        body.append(f"**Trigger:** ${trigger:,.2f}  ")
+    body += [
         "",
         "## Reasoning",
         "",

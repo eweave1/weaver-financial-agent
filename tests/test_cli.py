@@ -188,7 +188,7 @@ class TestLogPredictionInteractive:
                 "up",
                 "2 weeks",
                 "0.7",
-                "2026-08-01",
+                "2026-09-01",
                 "Earnings catalyst, target $190 from $130",
             ]) + "\n",
             env=_env(tmp_path),
@@ -207,7 +207,7 @@ class TestLogPredictionInteractive:
                 "--direction", "up",
                 "--timeframe", "2 weeks",
                 "--confidence", "0.7",
-                "--resolve-by", "2026-08-01",
+                "--resolve-by", "2026-09-01",
                 "--reasoning", "Test reasoning",
             ],
             env=_env(tmp_path),
@@ -223,7 +223,7 @@ class TestLogPredictionInteractive:
             main,
             ["log-prediction", "--ticker", "NVDA", "--direction", "up",
              "--timeframe", "2 weeks", "--confidence", "0.7",
-             "--resolve-by", "2026-08-01"],
+             "--resolve-by", "2026-09-01"],
             input="Support at $130, resistance $190, range $348->$297\n",
             env=_env(tmp_path),
         )
@@ -239,7 +239,7 @@ class TestLogPredictionInteractive:
             main,
             ["log-prediction", "--ticker", "NVDA", "--direction", "up",
              "--timeframe", "2 weeks", "--confidence", "0.7",
-             "--resolve-by", "2026-08-01", "--reasoning", "Test"],
+             "--resolve-by", "2026-09-01", "--reasoning", "Test"],
             env=_env(tmp_path),
         )
         assert result.exit_code == 0
@@ -253,7 +253,7 @@ class TestLogPredictionValidation:
             main,
             ["log-prediction", "--ticker", "NVDA", "--direction", "up",
              "--timeframe", "2 weeks", "--confidence", "1.5",
-             "--resolve-by", "2026-08-01", "--reasoning", "Test"],
+             "--resolve-by", "2026-09-01", "--reasoning", "Test"],
             env=_env(tmp_path),
         )
         assert result.exit_code != 0
@@ -265,7 +265,7 @@ class TestLogPredictionValidation:
             main,
             ["log-prediction", "--ticker", "NVDA", "--direction", "up",
              "--timeframe", "2 weeks", "--confidence", "-0.1",
-             "--resolve-by", "2026-08-01", "--reasoning", "Test"],
+             "--resolve-by", "2026-09-01", "--reasoning", "Test"],
             env=_env(tmp_path),
         )
         assert result.exit_code != 0
@@ -300,7 +300,7 @@ class TestLogPredictionValidation:
             main,
             ["log-prediction", "--ticker", "NVDA", "--direction", "sideways",
              "--timeframe", "2 weeks", "--confidence", "0.7",
-             "--resolve-by", "2026-08-01", "--reasoning", "Test"],
+             "--resolve-by", "2026-09-01", "--reasoning", "Test"],
             env=_env(tmp_path),
         )
         assert result.exit_code != 0
@@ -317,7 +317,7 @@ class TestLogPredictionValidation:
                 "2 weeks",
                 "0.7",
                 "2020-01-01",    # past — rejected
-                "2026-08-01",    # future — accepted
+                "2026-09-01",    # future — accepted
                 "Test reasoning",
             ]) + "\n",
             env=_env(tmp_path),
@@ -342,7 +342,7 @@ class TestLogPredictionValidation:
                 "2 weeks",
                 "1.5",       # out of range — Click re-prompts automatically
                 "0.7",       # valid
-                "2026-08-01",
+                "2026-09-01",
                 "Test reasoning",
             ]) + "\n",
             env=_env(tmp_path),

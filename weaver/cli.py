@@ -197,6 +197,9 @@ def log_trade_cmd(
               help="Your reasoning for this prediction.")
 @click.option("--resolve-by", "resolve_by_str", default=None,
               help="Date to resolve the prediction by (YYYY-MM-DD).")
+@click.option("--trigger", default=None, type=float,
+              help="Explicit entry trigger price (e.g. 145.00). Optional — "
+                   "shown in the briefing alongside current price.")
 @click.option(
     "--date", "prediction_date",
     type=click.DateTime(formats=["%Y-%m-%d"]),
@@ -212,6 +215,7 @@ def log_prediction_cmd(
     confidence: Optional[float],
     reasoning: Optional[str],
     resolve_by_str: Optional[str],
+    trigger: Optional[float],
     prediction_date: Optional[datetime],
 ) -> None:
     """Log a directional prediction with a resolve-by date.
@@ -219,6 +223,7 @@ def log_prediction_cmd(
     All fields can be passed as flags or entered interactively when omitted.
     --reasoning is always safe to type freely at a prompt — dollar signs,
     arrows, and apostrophes all work without shell quoting.
+    --trigger sets an explicit entry price level shown in the morning briefing.
     """
     # ── structured fields ─────────────────────────────────────────────────────
     if ticker is None:
@@ -246,6 +251,14 @@ def log_prediction_cmd(
             )
             sys.exit(1)
 
+    # trigger: optional, flag-only (not prompted)
+    if trigger is not None and trigger <= 0:
+        click.echo(
+            f"Error: --trigger must be a positive price, got {trigger}",
+            err=True,
+        )
+        sys.exit(1)
+
     # resolve-by: validate future date whether from flag or prompt
     if resolve_by_str is None:
         resolve_by_date = _prompt_future_date("Resolve by (YYYY-MM-DD)")
@@ -270,6 +283,7 @@ def log_prediction_cmd(
             reasoning=reasoning,
             resolve_by=resolve_by_date,
             prediction_date=pd,
+            trigger=trigger,
         )
     except ValueError as exc:
         click.echo(f"Error: {exc}", err=True)
@@ -368,6 +382,90 @@ def resolve_predictions_cmd(
         click.echo(f"  Resolved: {pred['file'].name}\n")
 
     click.echo("All predictions resolved.")
+
+
+# ── brief ─────────────────────────────────────────────────────────────────────
+
+@main.command("brief")
+@click.option(
+    "--analyze",
+    is_flag=True,
+    default=False,
+    help="Synthesize all data with one DeepSeek call (requires OPENROUTER_API_KEY in .env).",
+)
+@click.option(
+    "--date", "briefing_date",
+    type=click.DateTime(formats=["%Y-%m-%d"]),
+    default=None,
+    help="Briefing date as YYYY-MM-DD (defaults to today).",
+)
+@click.pass_context
+def brief_cmd(
+    ctx: click.Context,
+    analyze: bool,
+    briefing_date: Optional[datetime],
+) -> None:
+    """Scan full watchlist and write a morning briefing to Trading/Briefings/.
+
+    Produces a prioritized three-tier briefing:
+    - Macro / Market (SPY, QQQ, VIX)
+    - AI-sector news (headlines appearing in 3+ ticker feeds)
+    - Watchlist — Needs attention / Watching / Quiet
+
+    Without --analyze (default): data only, no API call.
+    With --analyze: one DeepSeek call synthesizes all gathered data.
+    """
+    import os
+    from weaver.briefing import generate_briefing
+
+    vault_path = _vault(ctx)
+    config = load_config(ctx.obj["config_path"])
+    bd = briefing_date.date() if briefing_date else None
+
+    api_key: Optional[str] = None
+    if analyze:
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        if not api_key:
+            click.echo(
+                "Error: --analyze requires OPENROUTER_API_KEY to be set in .env",
+                err=True,
+            )
+            sys.exit(1)
+
+    watchlist = config.get("watchlist", {})
+    total = sum(len(v or []) for v in watchlist.values())
+
+    if analyze:
+        click.echo(
+            f"Scanning {total} tickers and analyzing with DeepSeek "
+            "(this may take 1-2 minutes)..."
+        )
+    else:
+        click.echo(f"Scanning {total} tickers...")
+
+    def _progress(ticker: str, ok: bool) -> None:
+        click.echo(f"  {ticker} {'✓' if ok else '✗'}")
+
+    try:
+        filepath, needs_tickers = generate_briefing(
+            vault_path=vault_path,
+            config=config,
+            analyze=analyze,
+            briefing_date=bd,
+            api_key=api_key,
+            model=get_analyze_model(config),
+            timeout=get_openrouter_timeout(config),
+            progress_cb=_progress,
+        )
+    except Exception as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+
+    if needs_tickers:
+        click.echo(f"Needs attention: {', '.join(needs_tickers)}")
+    else:
+        click.echo("Nothing flagged today.")
+    click.echo(f"Briefing written: {filepath}")
 
 
 # ── research ──────────────────────────────────────────────────────────────────

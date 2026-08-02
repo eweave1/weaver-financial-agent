@@ -327,7 +327,7 @@ def fetch_prior_views(vault_path: Path, ticker: str) -> dict[str, Any]:
             if str(fm.get("ticker", "")).upper() == ticker:
                 pred: dict[str, Any] = {"file": f.stem}
                 for key in ("prediction_date", "direction", "confidence",
-                            "reasoning", "resolve_by", "status", "outcome"):
+                            "reasoning", "resolve_by", "status", "outcome", "trigger"):
                     if fm.get(key) is not None:
                         pred[key] = fm[key]
                 predictions.append(pred)

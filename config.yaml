@@ -42,3 +42,10 @@ data:
 ai:
   analyze_model: deepseek/deepseek-v4-pro
   openrouter_timeout_seconds: 90
+
+briefing:
+  move_threshold_pct: 3.0
+  volume_threshold: 1.5
+  earnings_warning_days: 7
+  watching_move_threshold_pct: 1.5
+  watching_earnings_days: 14
