@@ -38,6 +38,7 @@ def generate_briefing(
     _ticker_data: Optional[dict[str, Any]] = None,
     _vix: Optional[float] = None,
     _ai_synthesis: Optional[str] = None,
+    _proposals: Optional[list[dict[str, Any]]] = None,
     progress_cb: Optional[Callable[[str, bool], None]] = None,
 ) -> tuple[Path, list[str]]:
     """Scan all watchlist tickers and write a morning briefing note.
@@ -115,6 +116,26 @@ def generate_briefing(
                 timeout=timeout,
             )
 
+    proposals: list[dict[str, Any]] = []
+    if analyze:
+        try:
+            from weaver.proposals import generate_proposals as _gen_proposals
+            proposals = _gen_proposals(
+                ticker_data=ticker_data,
+                buckets=buckets,
+                open_positions=open_positions,
+                open_predictions=open_predictions,
+                current_prices=current_prices,
+                vault_path=vault_path,
+                config=config,
+                api_key=api_key or "",
+                model=model,
+                timeout=timeout,
+                _proposals=_proposals,
+            )
+        except Exception:
+            proposals = []
+
     note = build_briefing_note(
         briefing_date=today,
         ticker_data=ticker_data,
@@ -126,6 +147,7 @@ def generate_briefing(
         open_predictions=open_predictions,
         synthesis=synthesis,
         vault_path=vault_path,
+        proposals=proposals,
     )
 
     briefing_dir = vault_path / "Trading" / "Briefings"
@@ -429,11 +451,22 @@ def build_briefing_note(
     open_predictions: list[dict[str, Any]],
     synthesis: Optional[str],
     vault_path: Path,
+    proposals: Optional[list[dict[str, Any]]] = None,
 ) -> str:
     lines: list[str] = []
 
     lines += ["---", f"date: {briefing_date}", "type: briefing", "---", ""]
     lines += [f"# Morning Briefing — {briefing_date}", ""]
+
+    # Trade proposals first — most actionable item at top of the briefing
+    if proposals:
+        lines += ["## Trade proposals", ""]
+        for prop in proposals:
+            lines.append(prop.get("text", f"**{prop['ticker']}** — proposal unavailable"))
+            lines.append("")
+    elif proposals is not None:
+        # analyze ran but found no setups
+        lines += ["## Trade proposals", "", "*No setups today.*", ""]
 
     if synthesis is not None:
         lines += ["## AI synthesis", "", synthesis, ""]

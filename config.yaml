@@ -49,3 +49,11 @@ briefing:
   earnings_warning_days: 7
   watching_move_threshold_pct: 1.5
   watching_earnings_days: 14
+
+proposals:
+  portfolio_value: 1000
+  max_risk_per_trade_pct: 1.0
+  max_single_position_pct: 5.0
+  max_basket_exposure_pct: 10.0
+  max_proposals_per_day: 2
+  trigger_proximity_pct: 2.0
