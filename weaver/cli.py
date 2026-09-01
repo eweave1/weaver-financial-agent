@@ -22,7 +22,7 @@ from typing import Optional
 import click
 
 from weaver.config import get_analyze_model, get_openrouter_timeout, get_vault_path, load_config
-from weaver.journal import VALID_ACTIONS, VALID_HORIZONS, log_trade
+from weaver.journal import VALID_ACTIONS, VALID_HORIZONS, close_buy_position, find_open_buys, log_trade, scan_open_positions
 from weaver.predictions import (
     VALID_DIRECTIONS,
     VALID_OUTCOMES,
@@ -95,6 +95,8 @@ def _vault(ctx: click.Context) -> Path:
 @click.option("--linked-buy", default=None,
               help="For sell entries: stem of the linked buy file "
                    "(e.g. '2026-06-30 NVDA buy').")
+@click.option("--stop-price", "stop_price", type=float, default=None,
+              help="Numeric stop-loss price for exit scanning (e.g. 145.00).")
 @click.pass_context
 def log_trade_cmd(
     ctx: click.Context,
@@ -108,6 +110,7 @@ def log_trade_cmd(
     target_exit: Optional[float],
     trade_date: Optional[datetime],
     linked_buy: Optional[str],
+    stop_price: Optional[float],
 ) -> None:
     """Log a buy or sell trade to the journal.
 
@@ -168,6 +171,7 @@ def log_trade_cmd(
             target_exit=target_exit,
             trade_date=td,
             linked_buy_file=linked_buy,
+            stop_price=stop_price,
         )
     except ValueError as exc:
         click.echo(f"Error: {exc}", err=True)
@@ -177,6 +181,18 @@ def log_trade_cmd(
         sys.exit(1)
 
     click.echo(f"Trade logged: {filepath}")
+
+    if action == "sell":
+        sell_date = td or date.today()
+        journal_dir = vault_path / "Trading" / "Journal"
+        _close_linked_buy_interactive(
+            journal_dir=journal_dir,
+            ticker=ticker,
+            sell_qty=quantity,
+            sell_price=price,
+            sell_date=sell_date,
+            linked_buy=linked_buy,
+        )
 
 
 # ── log-prediction ────────────────────────────────────────────────────────────
@@ -534,7 +550,151 @@ def research_cmd(
     click.echo(f"Research note written: {filepath}")
 
 
+# ── positions ─────────────────────────────────────────────────────────────────
+
+@main.command("positions")
+@click.pass_context
+def positions_cmd(ctx: click.Context) -> None:
+    """Show open positions and basket exposure vs cap."""
+    from weaver.proposals import get_basket_exposure
+
+    vault_path = _vault(ctx)
+    config = load_config(ctx.obj["config_path"])
+    proposals_cfg = config.get("proposals", {})
+    portfolio_value = float(proposals_cfg.get("portfolio_value", 0))
+    basket_cap_pct = float(proposals_cfg.get("max_basket_exposure_pct", 10.0))
+    basket_cap = portfolio_value * basket_cap_pct / 100
+
+    positions = scan_open_positions(vault_path, {})
+
+    if not positions:
+        click.echo("No open positions.")
+        return
+
+    click.echo(f"Open positions: {len(positions)}")
+    click.echo("")
+
+    for pos in positions:
+        ticker = pos["ticker"]
+        qty = pos.get("quantity")
+        entry = pos.get("entry_price")
+        status = pos.get("status", "open")
+        status_tag = " (partial)" if status == "partial" else ""
+
+        if entry is not None and qty is not None:
+            committed = float(entry) * float(qty)
+            click.echo(
+                f"  {ticker:<6s}  {float(qty):>6.1f} sh  "
+                f"entry ${float(entry):>9,.2f}  "
+                f"committed ${committed:>9,.2f}{status_tag}"
+            )
+        else:
+            click.echo(f"  {ticker}  qty={qty}  entry={entry}  (data incomplete)")
+
+    click.echo("")
+
+    exposure = get_basket_exposure(positions)
+    if portfolio_value > 0:
+        click.echo(
+            f"Basket exposure: ${exposure:,.2f} / ${basket_cap:,.2f} cap "
+            f"({basket_cap_pct:.0f}% of ${portfolio_value:,.2f} portfolio)"
+        )
+        if exposure > basket_cap:
+            click.echo("WARNING: OVER CAP — no new positions should be opened.")
+    else:
+        click.echo(f"Basket exposure: ${exposure:,.2f} (portfolio_value not configured)")
+
+
+# ── scan-exits ────────────────────────────────────────────────────────────────
+
+@main.command("scan-exits")
+@click.pass_context
+def scan_exits_cmd(ctx: click.Context) -> None:
+    """Scan open positions for exit conditions and send Telegram alerts if any.
+
+    Checks three conditions for each position with a numeric stop_price:
+      stop_breached    current price at or below the stop
+      approaching_stop within approaching_stop_pct% above the stop
+      2r_profit        current price at or above entry + 2*(entry-stop)
+
+    Silence when no alerts. On stop_breached Telegram failure, retries once and
+    writes a FAILED marker to stderr (grep-able in logs).
+    """
+    import os
+    from weaver.exits import deliver_alerts, format_exit_message, scan_exits
+
+    vault_path = _vault(ctx)
+    config = load_config(ctx.obj["config_path"])
+
+    alerts = scan_exits(vault_path, config)
+    if not alerts:
+        return
+
+    message = format_exit_message(alerts, date.today())
+    assert message is not None
+    click.echo(message)
+
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("WEAVER_TELEGRAM_CHAT_ID")
+
+    if not bot_token or not chat_id:
+        click.echo(
+            "Warning: TELEGRAM_BOT_TOKEN or WEAVER_TELEGRAM_CHAT_ID not set — "
+            "alert not sent.",
+            err=True,
+        )
+        return
+
+    has_stop_breach = any(a["condition"] == "stop_breached" for a in alerts)
+    deliver_alerts(message, bot_token, chat_id, has_stop_breach)
+
+
 # ── private helpers ───────────────────────────────────────────────────────────
+
+def _close_linked_buy_interactive(
+    journal_dir: Path,
+    ticker: str,
+    sell_qty: float,
+    sell_price: float,
+    sell_date: date,
+    linked_buy: Optional[str],
+) -> None:
+    """Find and close the matching buy file, printing status or warnings."""
+    if linked_buy:
+        stem = linked_buy.strip()
+        buy_path = journal_dir / f"{stem}.md"
+        if not buy_path.exists():
+            click.echo(
+                f"Warning: linked buy file not found: {buy_path.name}\n"
+                f"  Sell recorded but buy status was not updated.",
+                err=True,
+            )
+            return
+    else:
+        candidates = find_open_buys(journal_dir, ticker)
+        if not candidates:
+            click.echo(
+                f"Warning: no open {ticker} buy found — "
+                f"sell recorded but no buy was closed.",
+                err=True,
+            )
+            return
+        if len(candidates) > 1:
+            click.echo(
+                f"Warning: multiple open {ticker} positions. "
+                f"Re-run with --linked-buy <stem>:",
+                err=True,
+            )
+            for c in candidates:
+                click.echo(f"  {c.stem}", err=True)
+            click.echo("  Sell recorded but no buy was closed.", err=True)
+            return
+        buy_path = candidates[0]
+        click.echo(f"Matched open buy: {buy_path.stem}")
+
+    new_status = close_buy_position(buy_path, sell_qty, sell_price, sell_date)
+    click.echo(f"Buy {new_status}: {buy_path.stem}")
+
 
 def _prompt_future_date(prompt_text: str) -> date:
     """Prompt interactively for a YYYY-MM-DD date that must be in the future.

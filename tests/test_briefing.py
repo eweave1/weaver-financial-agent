@@ -610,6 +610,7 @@ class TestBriefingAnalyze:
                 analyze=True,
                 _ticker_data=_full_ticker_data(config),
                 _vix=None,
+                _proposals=[],  # bypass live proposals pipeline; this test is about synthesis
                 api_key="test-key",
                 model="deepseek/deepseek-v4-pro",
             )

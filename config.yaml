@@ -57,3 +57,15 @@ proposals:
   max_basket_exposure_pct: 10.0
   max_proposals_per_day: 2
   trigger_proximity_pct: 2.0
+  stance: balanced       # balanced | conservative
+  # Technical setup detection thresholds — tuned after observing all-no-trade output
+  ma_proximity_pct: 4.0   # flag if close is within X% of 20-day MA
+  rsi_low: 35             # RSI lower bound (35 = oversold boundary; below = falling knife)
+  rsi_high: 70            # RSI upper bound (70 = overbought boundary; above = extended)
+
+exits:
+  approaching_stop_pct: 2.0  # alert when current price is within X% above stop
+
+regime:
+  mode: warn   # warn | halt | off
+  ma_period: 20

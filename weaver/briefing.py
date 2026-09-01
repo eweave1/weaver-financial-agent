@@ -7,13 +7,13 @@ With --analyze: one LLM call synthesizes all gathered data.
 
 from __future__ import annotations
 
-import re
 from datetime import date
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 import requests
 
+from weaver.journal import scan_open_positions
 from weaver.predictions import _coerce_date, _parse_frontmatter
 from weaver.research import fetch_news, fetch_snapshot
 
@@ -39,6 +39,7 @@ def generate_briefing(
     _vix: Optional[float] = None,
     _ai_synthesis: Optional[str] = None,
     _proposals: Optional[list[dict[str, Any]]] = None,
+    _regime: Optional[dict[str, Any]] = None,
     progress_cb: Optional[Callable[[str, bool], None]] = None,
 ) -> tuple[Path, list[str]]:
     """Scan all watchlist tickers and write a morning briefing note.
@@ -53,6 +54,11 @@ def generate_briefing(
     all_ticker_set = set(all_tickers)
 
     if _ticker_data is None:
+        from weaver.regime import get_regime
+        regime_state: dict[str, Any] = (
+            _regime if _regime is not None else get_regime(config)
+        )
+
         extra_tickers = _get_open_item_tickers(vault_path, all_ticker_set)
         tickers_to_fetch = all_tickers + extra_tickers
 
@@ -79,7 +85,11 @@ def generate_briefing(
             if progress_cb:
                 progress_cb(ticker, not bool(ticker_data[ticker].get("error")))
     else:
+        # test/injection mode — use provided regime or unknown (no network call)
         ticker_data = _ticker_data
+        regime_state = _regime if _regime is not None else {
+            "regime": "unknown", "qqq_price": None, "qqq_ma20": None, "pct_from_ma": None
+        }
 
     vix = _vix if _vix is not None else fetch_vix()
     sector_headlines = find_sector_news(ticker_data)
@@ -132,6 +142,7 @@ def generate_briefing(
                 model=model,
                 timeout=timeout,
                 _proposals=_proposals,
+                _regime=regime_state,
             )
         except Exception:
             proposals = []
@@ -148,6 +159,8 @@ def generate_briefing(
         synthesis=synthesis,
         vault_path=vault_path,
         proposals=proposals,
+        regime_state=regime_state,
+        regime_mode=str(config.get("regime", {}).get("mode", "warn")).lower(),
     )
 
     briefing_dir = vault_path / "Trading" / "Briefings"
@@ -272,56 +285,6 @@ def bucket_tickers(
         "failed": failed,
     }
 
-
-def scan_open_positions(
-    vault_path: Path,
-    current_prices: dict[str, float],
-) -> list[dict[str, Any]]:
-    """Return open buy entries from the journal, excluding those referenced by a sell.
-
-    Approximation: buy entries linked by a sell's linked_buy field are treated as closed.
-    """
-    journal_dir = vault_path / "Trading" / "Journal"
-    if not journal_dir.exists():
-        return []
-
-    sold_stems: set[str] = set()
-    for f in journal_dir.glob("*.md"):
-        fm = _parse_frontmatter(f.read_text(encoding="utf-8"))
-        if fm.get("action") == "sell":
-            lb = fm.get("linked_buy", "")
-            if lb:
-                m = re.search(r"\[\[(.+?)\]\]", str(lb))
-                if m:
-                    sold_stems.add(m.group(1))
-
-    positions: list[dict[str, Any]] = []
-    for f in sorted(journal_dir.glob("*.md")):
-        fm = _parse_frontmatter(f.read_text(encoding="utf-8"))
-        if fm.get("action") != "buy":
-            continue
-        if f.stem in sold_stems:
-            continue
-
-        ticker = str(fm.get("ticker", "")).upper()
-        entry_price = fm.get("price")
-        current = current_prices.get(ticker)
-
-        pos: dict[str, Any] = {
-            "ticker": ticker,
-            "entry_date": fm.get("entry_date"),
-            "entry_price": entry_price,
-            "current_price": current,
-            "quantity": fm.get("quantity"),
-            "time_horizon": fm.get("time_horizon"),
-            "file_stem": f.stem,
-        }
-        if entry_price is not None and current is not None:
-            pos["pnl_pct"] = (float(current) - float(entry_price)) / float(entry_price)
-
-        positions.append(pos)
-
-    return positions
 
 
 def scan_open_predictions(
@@ -452,11 +415,31 @@ def build_briefing_note(
     synthesis: Optional[str],
     vault_path: Path,
     proposals: Optional[list[dict[str, Any]]] = None,
+    regime_state: Optional[dict[str, Any]] = None,
+    regime_mode: str = "warn",
 ) -> str:
     lines: list[str] = []
 
     lines += ["---", f"date: {briefing_date}", "type: briefing", "---", ""]
     lines += [f"# Morning Briefing — {briefing_date}", ""]
+
+    # Dedicated regime block — only when downtrend and mode isn't off
+    if regime_state is not None and regime_mode != "off":
+        regime = regime_state.get("regime", "unknown")
+        if regime == "downtrend":
+            pct = regime_state.get("pct_from_ma")
+            pct_str = f"{abs(pct):.1%}" if pct is not None else "unknown"
+            if regime_mode == "halt":
+                action_line = "Proposals halted: no new setups will be suggested."
+            else:
+                action_line = "Proposals warned: only the strongest setups will be suggested."
+            lines += [
+                "## Market Regime",
+                "",
+                f"DOWNTREND — QQQ is {pct_str} below its 20-day MA.",
+                action_line,
+                "",
+            ]
 
     # Trade proposals first — most actionable item at top of the briefing
     if proposals:
@@ -487,6 +470,16 @@ def build_briefing_note(
         macro_parts.append(f"VIX: {vix:.1f}")
 
     lines.append("  |  ".join(macro_parts) if macro_parts else "*Market data unavailable.*")
+
+    if regime_state is not None:
+        regime = regime_state.get("regime", "unknown").upper()
+        pct = regime_state.get("pct_from_ma")
+        if pct is not None:
+            side = "above" if pct >= 0 else "below"
+            lines.append(f"QQQ Regime: {regime} ({abs(pct):.1%} {side} 20MA)")
+        else:
+            lines.append(f"QQQ Regime: {regime}")
+
     lines.append("")
 
     # --- Tier 2: AI-sector news ---
@@ -628,23 +621,10 @@ def _get_open_item_tickers(vault_path: Path, watchlist_set: set[str]) -> list[st
     """Return tickers from open positions/predictions that aren't in the watchlist."""
     extra: set[str] = set()
 
-    journal_dir = vault_path / "Trading" / "Journal"
-    if journal_dir.exists():
-        sold_stems: set[str] = set()
-        for f in journal_dir.glob("*.md"):
-            fm = _parse_frontmatter(f.read_text(encoding="utf-8"))
-            if fm.get("action") == "sell":
-                lb = fm.get("linked_buy", "")
-                if lb:
-                    m = re.search(r"\[\[(.+?)\]\]", str(lb))
-                    if m:
-                        sold_stems.add(m.group(1))
-        for f in journal_dir.glob("*.md"):
-            fm = _parse_frontmatter(f.read_text(encoding="utf-8"))
-            if fm.get("action") == "buy" and f.stem not in sold_stems:
-                t = str(fm.get("ticker", "")).upper()
-                if t and t not in watchlist_set:
-                    extra.add(t)
+    for pos in scan_open_positions(vault_path, {}):
+        t = pos["ticker"]
+        if t and t not in watchlist_set:
+            extra.add(t)
 
     pred_dir = vault_path / "Trading" / "Predictions"
     if pred_dir.exists():

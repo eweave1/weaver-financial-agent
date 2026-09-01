@@ -10,6 +10,9 @@ from unittest.mock import patch
 import pytest
 
 from weaver.proposals import (
+    _build_proposal_prompt,
+    _compute_signals,
+    _filter_news,
     calculate_position_size,
     format_proposal_text,
     generate_proposals,
@@ -248,7 +251,8 @@ class TestGenerateProposals:
 
     def test_llm_failure_produces_no_trade_entry(self, config, tmp_path):
         buckets = {"needs_attention": [_make_bucket_entry("NVDA")]}
-        with patch("weaver.proposals._call_llm", return_value=None):
+        with patch("weaver.proposals._call_llm", return_value=None), \
+             patch("weaver.proposals._fetch_ohlcv", return_value=None):
             result = generate_proposals(
                 ticker_data={"NVDA": {"snapshot": {}, "news": []}},
                 buckets=buckets,
@@ -273,7 +277,8 @@ class TestGenerateProposals:
             "confidence": 0.7,
         }
         buckets = {"needs_attention": [_make_bucket_entry("AMD")]}
-        with patch("weaver.proposals._call_llm", return_value=long_response):
+        with patch("weaver.proposals._call_llm", return_value=long_response), \
+             patch("weaver.proposals._fetch_ohlcv", return_value=None):
             result = generate_proposals(
                 ticker_data={"AMD": {"snapshot": {"current_price": 200.0}, "news": []}},
                 buckets=buckets,
@@ -391,3 +396,262 @@ class TestFormatProposalText:
         }
         text = format_proposal_text(proposal)
         assert "NO TRADE" in text
+
+
+# ── helpers for new tests ─────────────────────────────────────────────────────
+
+
+def _make_ohlcv_rows(
+    n: int,
+    base_close: float = 100.0,
+    daily_change: float = 0.0,
+) -> list[dict]:
+    """Generate n synthetic OHLCV rows with controllable close prices."""
+    rows = []
+    for i in range(n):
+        close = base_close + i * daily_change
+        rows.append({
+            "date": f"2026-07-{i + 1:02d}",
+            "open": close - 0.5,
+            "high": close + 1.0,
+            "low": close - 1.0,
+            "close": close,
+            "volume": 1_000_000.0,
+        })
+    return rows
+
+
+# ── TestComputeSignals ────────────────────────────────────────────────────────
+
+
+class TestComputeSignals:
+    def test_returns_none_when_fewer_than_20_rows(self, config):
+        rows = _make_ohlcv_rows(15, base_close=100.0)
+        assert _compute_signals(rows, config) is None
+
+    def test_ma20_is_mean_of_last_20_closes(self, config):
+        # 20 rows all at $100 → MA = 100
+        rows = _make_ohlcv_rows(20, base_close=100.0)
+        sig = _compute_signals(rows, config)
+        assert sig is not None
+        assert abs(sig["ma20"] - 100.0) < 0.01
+
+    def test_near_ma_true_when_within_proximity(self, config):
+        # 20 rows at $100; current close = $100 → 0% from MA, within 1.5%
+        rows = _make_ohlcv_rows(20, base_close=100.0)
+        sig = _compute_signals(rows, config)
+        assert sig is not None
+        assert sig["near_ma"] is True
+
+    def test_near_ma_false_when_far_from_ma(self, config):
+        # MA ≈ $100, final close at $110 (10% above)
+        rows = _make_ohlcv_rows(20, base_close=100.0)
+        rows[-1]["close"] = 110.0
+        sig = _compute_signals(rows, config)
+        assert sig is not None
+        assert sig["near_ma"] is False
+
+    def test_rsi_neutral_when_equal_gains_and_losses(self, config):
+        # 15 closes: equal alternating +1/-1 → RSI ≈ 50 → neutral (40-60)
+        rows = _make_ohlcv_rows(20, base_close=100.0)
+        for i in range(1, 15):
+            rows[-(i)]["close"] = 100.0 + (1.0 if i % 2 == 0 else -1.0)
+        sig = _compute_signals(rows, config)
+        assert sig is not None
+        assert sig["rsi_neutral"] is True
+        assert 40.0 <= sig["rsi14"] <= 60.0
+
+    def test_rsi_not_neutral_when_all_gains(self, config):
+        # All 14 changes are gains → RSI = 100 → above neutral zone
+        rows = _make_ohlcv_rows(20, base_close=100.0, daily_change=1.0)
+        sig = _compute_signals(rows, config)
+        assert sig is not None
+        assert sig["rsi14"] == pytest.approx(100.0)
+        assert sig["rsi_neutral"] is False
+
+    def test_returns_none_on_empty_rows(self, config):
+        assert _compute_signals([], config) is None
+
+
+# ── TestFilterNews ────────────────────────────────────────────────────────────
+
+
+class TestFilterNews:
+    def _item(self, title: str = "Good headline", publisher: str = "Reuters") -> dict:
+        return {"title": title, "publisher": publisher}
+
+    def test_banned_publisher_stripped(self):
+        news = [self._item(publisher="Zacks Investment Research")]
+        assert _filter_news(news) == []
+
+    def test_banned_publisher_case_insensitive(self):
+        news = [self._item(publisher="THE MOTLEY FOOL")]
+        assert _filter_news(news) == []
+
+    def test_listicle_pattern_stripped(self):
+        news = [self._item(title="5 Stocks to Buy This Week")]
+        assert _filter_news(news) == []
+
+    def test_listicle_top_n_stripped(self):
+        news = [self._item(title="Top 10 AI Stocks for 2026")]
+        assert _filter_news(news) == []
+
+    def test_buy_in_title_not_filtered(self):
+        news = [self._item(title="NVDA Reports Strong Buy Signal from Analysts")]
+        result = _filter_news(news)
+        assert len(result) == 1
+
+    def test_alert_in_title_not_filtered(self):
+        news = [self._item(title="Earnings Alert: NVDA Beat Estimates")]
+        result = _filter_news(news)
+        assert len(result) == 1
+
+    def test_non_banned_publisher_kept(self):
+        news = [self._item(publisher="Reuters"), self._item(publisher="Bloomberg")]
+        assert len(_filter_news(news)) == 2
+
+    def test_empty_list_passes_through(self):
+        assert _filter_news([]) == []
+
+    def test_mixed_list_filters_correctly(self):
+        news = [
+            self._item(title="Solid earnings report", publisher="Reuters"),
+            self._item(publisher="GuruFocus"),
+            self._item(title="Best 3 Stocks to Own Now", publisher="Reuters"),
+        ]
+        result = _filter_news(news)
+        assert len(result) == 1
+        assert result[0]["title"] == "Solid earnings report"
+
+
+# ── TestBuildProposalPrompt ───────────────────────────────────────────────────
+
+
+class TestBuildProposalPrompt:
+    def _candidate(self, ticker: str = "NVDA") -> dict:
+        return {"ticker": ticker, "reason": "needs attention: +5%", "source": "needs_attention"}
+
+    def test_ohlcv_table_present_when_rows_provided(self, config):
+        rows = _make_ohlcv_rows(10, base_close=130.0)
+        prompt = _build_proposal_prompt(
+            candidate=self._candidate(),
+            ticker_data={"NVDA": {"snapshot": {}, "news": []}},
+            open_positions=[],
+            open_predictions=[],
+            config=config,
+            basket_exposure=0.0,
+            ohlcv_rows=rows,
+        )
+        assert "price history" in prompt.lower()
+        assert "| Date |" in prompt
+        assert "Close" in prompt
+
+    def test_ohlcv_table_absent_when_no_rows(self, config):
+        prompt = _build_proposal_prompt(
+            candidate=self._candidate(),
+            ticker_data={"NVDA": {"snapshot": {}, "news": []}},
+            open_positions=[],
+            open_predictions=[],
+            config=config,
+            basket_exposure=0.0,
+            ohlcv_rows=[],
+        )
+        assert "price history" not in prompt.lower()
+
+    def test_tech_signal_shown_in_prompt(self, config):
+        sig = {"ma20": 128.5, "rsi14": 52.0, "near_ma": True, "rsi_neutral": True}
+        prompt = _build_proposal_prompt(
+            candidate=self._candidate(),
+            ticker_data={"NVDA": {"snapshot": {}, "news": []}},
+            open_positions=[],
+            open_predictions=[],
+            config=config,
+            basket_exposure=0.0,
+            tech_signal=sig,
+        )
+        assert "20-day MA" in prompt
+        assert "128.50" in prompt
+        assert "RSI" in prompt
+
+    def test_banned_news_source_excluded_from_prompt(self, config):
+        news = [
+            {"title": "Good analysis", "publisher": "Reuters"},
+            {"title": "5 stocks to buy", "publisher": "Zacks"},
+        ]
+        prompt = _build_proposal_prompt(
+            candidate=self._candidate(),
+            ticker_data={"NVDA": {"snapshot": {}, "news": news}},
+            open_positions=[],
+            open_predictions=[],
+            config=config,
+            basket_exposure=0.0,
+        )
+        assert "Good analysis" in prompt
+        assert "5 stocks to buy" not in prompt
+
+    def test_only_last_10_rows_shown_when_more_provided(self, config):
+        rows = _make_ohlcv_rows(15, base_close=100.0)
+        prompt = _build_proposal_prompt(
+            candidate=self._candidate(),
+            ticker_data={"NVDA": {"snapshot": {}, "news": []}},
+            open_positions=[],
+            open_predictions=[],
+            config=config,
+            basket_exposure=0.0,
+            ohlcv_rows=rows,
+        )
+        assert "last 10 sessions" in prompt
+
+
+# ── TestIdentifyCandidates P3 additions ──────────────────────────────────────
+
+
+class TestIdentifyCandidatesP3:
+    def test_technical_setup_produces_candidate(self, config):
+        tech_signals = {
+            "NVDA": {"ma20": 130.0, "rsi14": 50.0, "near_ma": True, "rsi_neutral": True}
+        }
+        result = identify_candidates(
+            {"needs_attention": []},
+            [],
+            {},
+            config,
+            tech_signals=tech_signals,
+        )
+        assert any(c["ticker"] == "NVDA" for c in result)
+        nvda = next(c for c in result if c["ticker"] == "NVDA")
+        assert nvda["source"] == "technical"
+
+    def test_technical_ticker_not_qualified_when_far_from_ma(self, config):
+        tech_signals = {
+            "NVDA": {"ma20": 130.0, "rsi14": 50.0, "near_ma": False, "rsi_neutral": True}
+        }
+        result = identify_candidates({"needs_attention": []}, [], {}, config, tech_signals=tech_signals)
+        assert not any(c["ticker"] == "NVDA" for c in result)
+
+    def test_p3_ticker_in_p2_not_duplicated(self, config):
+        # NVDA is already in needs_attention (P2) AND has a tech setup (P3)
+        tech_signals = {
+            "NVDA": {"ma20": 100.0, "rsi14": 50.0, "near_ma": True, "rsi_neutral": True}
+        }
+        buckets = {"needs_attention": [_make_bucket_entry("NVDA")]}
+        result = identify_candidates(buckets, [], {}, config, tech_signals=tech_signals)
+        assert len([c for c in result if c["ticker"] == "NVDA"]) == 1
+
+    def test_p3_ticker_with_none_signal_skipped(self, config):
+        # None means fetch failed — must not be included
+        tech_signals = {"NVDA": None}
+        result = identify_candidates({"needs_attention": []}, [], {}, config, tech_signals=tech_signals)
+        assert not any(c["ticker"] == "NVDA" for c in result)
+
+    def test_p3_only_fills_remaining_quota(self, config):
+        # P2 already fills max_proposals=2; P3 ticker should not appear
+        buckets = {
+            "needs_attention": [_make_bucket_entry("NVDA"), _make_bucket_entry("AMD")]
+        }
+        tech_signals = {
+            "MSFT": {"ma20": 100.0, "rsi14": 50.0, "near_ma": True, "rsi_neutral": True}
+        }
+        result = identify_candidates(buckets, [], {}, config, tech_signals=tech_signals)
+        assert len(result) == 2
+        assert not any(c["ticker"] == "MSFT" for c in result)
